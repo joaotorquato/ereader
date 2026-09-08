@@ -1,0 +1,314 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="theme-color" content="#eef0ea">
+<title>Read aloud</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Literata:ital,opsz,wght@0,7..72,400;0,7..72,600;1,7..72,400&display=swap" rel="stylesheet">
+<style>
+  :root {
+    --page: #eef0ea;        /* cool paper */
+    --ink: #1c2321;
+    --muted: #6b746f;
+    --rule: #cfd4cc;
+    --accent: #1e4e5f;      /* deep teal ink */
+    --mark: #ffd84d;        /* highlighter */
+    --mark-soft: #fff1b3;
+    --font: "Literata", "Iowan Old Style", "Palatino Linotype", Georgia, serif;
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; height: 100%; background: var(--page); color: var(--ink); font-family: var(--font); }
+  body { display: flex; flex-direction: column; }
+
+  header {
+    display: flex; align-items: center; gap: 12px;
+    padding: 10px 16px; border-bottom: 1px solid var(--rule);
+    padding-top: calc(10px + env(safe-area-inset-top));
+  }
+  header h1 { font-size: 15px; font-weight: 600; margin: 0; flex: 1; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  header small { color: var(--muted); font-size: 12px; }
+
+  button {
+    font: inherit; font-size: 14px; color: var(--ink);
+    background: transparent; border: 1px solid var(--rule); border-radius: 999px;
+    padding: 7px 14px; cursor: pointer;
+  }
+  button:focus-visible, select:focus-visible, input:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+  button.primary { background: var(--accent); color: #fff; border-color: var(--accent); }
+  button:disabled { opacity: .4; cursor: default; }
+  input[type=file] { display: none; }
+
+  main { flex: 1; overflow-y: auto; -webkit-overflow-scrolling: touch; }
+  .sheet {
+    max-width: 38em; margin: 0 auto; padding: 32px 22px 48px;
+    font-size: 19px; line-height: 1.6;
+  }
+  .sheet h2 { font-size: 1.35em; font-weight: 600; line-height: 1.25; margin: 0 0 1em; }
+  .sheet p { margin: 0 0 0.9em; text-align: left; hyphens: auto; }
+  .sheet p.reading { }
+  .sheet p[data-p] { cursor: pointer; }
+  .w { border-radius: 3px; transition: background-color 90ms linear; }
+  .w.on { background: var(--mark); }
+  .sheet p.reading { box-shadow: -14px 0 0 -10px var(--mark-soft); }
+
+  .empty { text-align: center; color: var(--muted); padding: 20vh 24px; }
+  .empty p { margin: 0 0 18px; }
+
+  footer {
+    border-top: 1px solid var(--rule); padding: 10px 16px;
+    padding-bottom: calc(12px + env(safe-area-inset-bottom));
+    display: grid; gap: 10px;
+  }
+  .transport { display: flex; align-items: center; justify-content: center; gap: 12px; }
+  .transport .play { width: 64px; height: 44px; font-size: 18px; }
+  .transport button { min-width: 44px; height: 44px; padding: 0 14px; }
+  .settings { display: flex; align-items: center; gap: 10px; font-size: 13px; color: var(--muted); flex-wrap: wrap; }
+  .settings label { display: flex; align-items: center; gap: 6px; }
+  select { font: inherit; font-size: 13px; max-width: 46vw; padding: 4px 6px; border: 1px solid var(--rule); border-radius: 6px; background: #fff; color: var(--ink); }
+  input[type=range] { width: 110px; accent-color: var(--accent); }
+  .progress { height: 3px; background: var(--rule); border-radius: 2px; overflow: hidden; }
+  .progress i { display: block; height: 100%; width: 0; background: var(--accent); transition: width 200ms; }
+  .status { font-size: 12px; color: var(--muted); text-align: center; min-height: 1em; }
+
+  @media (prefers-reduced-motion: reduce) { .w, .progress i { transition: none; } }
+</style>
+</head>
+<body>
+
+<header>
+  <h1 id="title">Read aloud</h1>
+  <small id="where"></small>
+  <label><input type="file" id="file" accept=".pdf,.epub,application/pdf,application/epub+zip"><button type="button" onclick="document.getElementById('file').click()">Open book</button></label>
+</header>
+
+<main id="main">
+  <div class="sheet" id="sheet">
+    <div class="empty">
+      <p>Open a PDF or EPUB to start.</p>
+      <p>Tap any paragraph to read from there. Words light up as they're spoken.</p>
+    </div>
+  </div>
+</main>
+
+<footer>
+  <div class="progress"><i id="bar"></i></div>
+  <div class="transport">
+    <button id="prev" disabled aria-label="Previous section">‹</button>
+    <button id="play" class="primary play" disabled aria-label="Play">▶</button>
+    <button id="next" disabled aria-label="Next section">›</button>
+  </div>
+  <div class="settings">
+    <label>Speed <input type="range" id="rate" min="0.6" max="2" step="0.1" value="1"><span id="rateVal">1.0×</span></label>
+    <label>Voice <select id="voice"></select></label>
+  </div>
+  <div class="status" id="status"></div>
+</footer>
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/jszip/3.10.1/jszip.min.js"></script>
+<script>
+pdfjsLib.GlobalWorkerOptions.workerSrc = "https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js";
+
+// ---------- state ----------
+const book = { title: "", lang: "", sections: [] }; // section: {title, paras:[string]}
+let sec = 0, para = -1, playing = false, gen = 0;
+const $ = id => document.getElementById(id);
+const synth = window.speechSynthesis;
+
+// ---------- file loading ----------
+$("file").addEventListener("change", async e => {
+  const f = e.target.files[0]; if (!f) return;
+  stop(); setStatus("Opening " + f.name + "…");
+  try {
+    const buf = await f.arrayBuffer();
+    if (/\.epub$/i.test(f.name) || f.type.includes("epub")) await loadEpub(buf, f.name);
+    else await loadPdf(buf, f.name);
+    sec = 0; para = -1; render(); setStatus("");
+    $("play").disabled = false;
+  } catch (err) { console.error(err); setStatus("Couldn't open this file: " + err.message); }
+});
+
+async function loadPdf(buf, name) {
+  const pdf = await pdfjsLib.getDocument({ data: buf }).promise;
+  const meta = await pdf.getMetadata().catch(() => null);
+  book.title = (meta && meta.info && meta.info.Title) || name.replace(/\.pdf$/i, "");
+  book.lang = "";
+  book.sections = [];
+  for (let p = 1; p <= pdf.numPages; p++) {
+    const page = await pdf.getPage(p);
+    const tc = await page.getTextContent();
+    // group items into lines by y, then lines into paragraphs
+    const lines = []; let cur = null, lastY = null;
+    for (const it of tc.items) {
+      if (!it.str) continue;
+      const y = Math.round(it.transform[5]);
+      if (lastY === null || Math.abs(y - lastY) > 3) { cur = []; lines.push(cur); }
+      cur.push(it.str); lastY = y;
+    }
+    const paras = []; let acc = "";
+    for (const l of lines) {
+      const t = l.join(" ").replace(/\s+/g, " ").trim(); if (!t) continue;
+      acc = acc ? (acc.endsWith("-") ? acc.slice(0, -1) + t : acc + " " + t) : t;
+      if (/[.!?:;»"”)]$/.test(t) || t.length < 40) { paras.push(acc); acc = ""; }
+    }
+    if (acc) paras.push(acc);
+    book.sections.push({ title: "Page " + p, paras: paras.length ? paras : ["(no text on this page)"] });
+    if (p % 10 === 0) setStatus(`Reading pages… ${p}/${pdf.numPages}`);
+  }
+}
+
+async function loadEpub(buf, name) {
+  const zip = await JSZip.loadAsync(buf);
+  const xml = async (path, mime = "application/xml") => new DOMParser().parseFromString(await zip.file(path).async("string"), mime);
+  const container = await xml("META-INF/container.xml");
+  const opfPath = container.querySelector("rootfile").getAttribute("full-path");
+  const base = opfPath.includes("/") ? opfPath.slice(0, opfPath.lastIndexOf("/") + 1) : "";
+  const opf = await xml(opfPath);
+  const g = tag => { const el = opf.getElementsByTagName(tag)[0]; return el ? el.textContent.trim() : ""; };
+  book.title = g("dc:title") || g("title") || name.replace(/\.epub$/i, "");
+  book.lang = g("dc:language") || g("language") || "";
+  const items = {}; for (const it of opf.querySelectorAll("manifest > item")) items[it.getAttribute("id")] = it.getAttribute("href");
+  book.sections = [];
+  for (const ref of opf.querySelectorAll("spine > itemref")) {
+    const href = items[ref.getAttribute("idref")]; if (!href) continue;
+    const path = decodeURIComponent(base + href.split("#")[0]);
+    const file = zip.file(path); if (!file) continue;
+    let doc;
+    try { doc = new DOMParser().parseFromString(await file.async("string"), "application/xhtml+xml"); if (doc.querySelector("parsererror")) throw 0; }
+    catch { doc = new DOMParser().parseFromString(await file.async("string"), "text/html"); }
+    const body = doc.body || doc.documentElement;
+    const paras = []; let title = "";
+    const walk = el => {
+      for (const n of el.children) {
+        const tag = n.tagName.toLowerCase();
+        if (["script", "style", "nav"].includes(tag)) continue;
+        const hasBlock = n.querySelector("p,div,h1,h2,h3,h4,h5,h6,li,blockquote,section,article");
+        if (hasBlock) { walk(n); continue; }
+        const t = n.textContent.replace(/\s+/g, " ").trim();
+        if (!t) continue;
+        if (/^h[1-6]$/.test(tag) && !title) title = t;
+        paras.push(t);
+      }
+    };
+    walk(body);
+    if (paras.length) book.sections.push({ title: title || `Section ${book.sections.length + 1}`, paras });
+  }
+  if (!book.sections.length) throw new Error("no readable text found");
+}
+
+// ---------- rendering ----------
+function render() {
+  const s = book.sections[sec];
+  $("title").textContent = book.title;
+  $("where").textContent = `${sec + 1} / ${book.sections.length}`;
+  $("bar").style.width = ((sec + 1) / book.sections.length * 100) + "%";
+  $("prev").disabled = sec === 0; $("next").disabled = sec === book.sections.length - 1;
+  const sheet = $("sheet"); sheet.innerHTML = "";
+  const h = document.createElement("h2"); h.textContent = s.title; sheet.appendChild(h);
+  s.paras.forEach((text, i) => {
+    const p = document.createElement("p"); p.dataset.p = i;
+    let pos = 0;
+    for (const tok of text.split(/(\s+)/)) {
+      if (!tok) continue;
+      if (/^\s+$/.test(tok)) p.appendChild(document.createTextNode(tok));
+      else { const w = document.createElement("span"); w.className = "w"; w.dataset.c = pos; w.textContent = tok; p.appendChild(w); }
+      pos += tok.length;
+    }
+    p.addEventListener("click", () => { stop(); para = i; play(); });
+    sheet.appendChild(p);
+  });
+  $("main").scrollTop = 0;
+}
+
+function highlight(pi, charIdx) {
+  document.querySelectorAll(".w.on").forEach(e => e.classList.remove("on"));
+  document.querySelectorAll("p.reading").forEach(e => e.classList.remove("reading"));
+  const p = document.querySelector(`p[data-p="${pi}"]`); if (!p) return;
+  p.classList.add("reading");
+  const words = p.querySelectorAll(".w"); let hit = null;
+  for (const w of words) { if (+w.dataset.c <= charIdx) hit = w; else break; }
+  if (hit) { hit.classList.add("on"); hit.scrollIntoView({ block: "center", behavior: "smooth" }); }
+}
+
+// ---------- speech ----------
+function voiceList() {
+  const vs = synth.getVoices(); const sel = $("voice"); const prev = sel.value; sel.innerHTML = "";
+  vs.forEach((v, i) => { const o = document.createElement("option"); o.value = i; o.textContent = `${v.name} (${v.lang})`; sel.appendChild(o); });
+  const want = (book.lang || navigator.language || "").slice(0, 2).toLowerCase();
+  let pick = vs.findIndex(v => v.lang.toLowerCase().startsWith(want));
+  if (prev && vs[prev]) pick = +prev;
+  if (pick >= 0) sel.value = pick;
+}
+synth.onvoiceschanged = voiceList; voiceList();
+
+function chunks(text) {
+  // sentence-ish chunks under ~220 chars; return [{text, offset}]
+  const out = []; const re = /[^.!?…]+[.!?…]*\s*/g; let m, cur = "", off = 0, curOff = 0;
+  while ((m = re.exec(text))) {
+    if (cur && cur.length + m[0].length > 220) { out.push({ text: cur, offset: curOff }); cur = ""; curOff = off; }
+    if (!cur) curOff = off;
+    cur += m[0]; off += m[0].length;
+  }
+  if (cur) out.push({ text: cur, offset: curOff });
+  return out.length ? out : [{ text, offset: 0 }];
+}
+
+function play() {
+  if (!book.sections.length) return;
+  if (para < 0) para = 0;
+  playing = true; $("play").textContent = "❚❚"; $("play").setAttribute("aria-label", "Pause");
+  speakPara(++gen);
+}
+
+function speakPara(g) {
+  if (g !== gen) return;
+  const s = book.sections[sec];
+  if (para >= s.paras.length) {            // next section
+    if (sec < book.sections.length - 1) { sec++; para = 0; render(); }
+    else { stop(); setStatus("End of book"); return; }
+  }
+  const text = book.sections[sec].paras[para];
+  const parts = chunks(text); let k = 0;
+  const voice = synth.getVoices()[$("voice").value];
+  const rate = +$("rate").value;
+  const next = () => {
+    if (g !== gen) return;
+    if (k >= parts.length) { para++; speakPara(g); return; }
+    const part = parts[k++];
+    const u = new SpeechSynthesisUtterance(part.text);
+    if (voice) { u.voice = voice; u.lang = voice.lang; }
+    u.rate = rate;
+    // fallback: estimated word timing when boundary events don't fire (common on Android)
+    let gotBoundary = false, est = null;
+    const words = []; { const re = /\S+/g; let m; while ((m = re.exec(part.text))) words.push(m.index); }
+    const startEst = () => {
+      const perWord = 1000 / (2.6 * rate); let i = 0;
+      est = setInterval(() => { if (i < words.length) highlight(para, part.offset + words[i++]); else clearInterval(est); }, perWord);
+    };
+    u.onstart = () => { highlight(para, part.offset); setTimeout(() => { if (!gotBoundary && g === gen) startEst(); }, 900); };
+    u.onboundary = ev => { if (ev.name && ev.name !== "word") return; gotBoundary = true; if (est) { clearInterval(est); est = null; } highlight(para, part.offset + ev.charIndex); };
+    u.onend = () => { if (est) clearInterval(est); next(); };
+    u.onerror = ev => { if (est) clearInterval(est); if (ev.error !== "interrupted" && ev.error !== "canceled") { setStatus("Speech error: " + ev.error); stop(); } };
+    synth.speak(u);
+  };
+  synth.cancel(); next();
+}
+
+function stop() {
+  gen++; playing = false; synth.cancel();
+  $("play").textContent = "▶"; $("play").setAttribute("aria-label", "Play");
+  document.querySelectorAll(".w.on").forEach(e => e.classList.remove("on"));
+}
+
+$("play").onclick = () => playing ? stop() : play();
+$("prev").onclick = () => { stop(); sec--; para = -1; render(); };
+$("next").onclick = () => { stop(); sec++; para = -1; render(); };
+$("rate").oninput = e => { $("rateVal").textContent = (+e.target.value).toFixed(1) + "×"; if (playing) { const p = para; stop(); para = p; play(); } };
+$("voice").onchange = () => { if (playing) { const p = para; stop(); para = p; play(); } };
+function setStatus(t) { $("status").textContent = t; }
+window.addEventListener("beforeunload", () => synth.cancel());
+</script>
+</body>
+</html>
