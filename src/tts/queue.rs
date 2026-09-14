@@ -165,11 +165,6 @@ impl TtsQueue {
         Ok(Pending::Waiting(rx))
     }
 
-    /// Conveniência: pede e espera.
-    pub async fn get(&self, req: Request) -> Result<Clip, String> {
-        self.request(req)?.wait().await
-    }
-
     /// Enfileira sem esperar. Não bloqueia: se a fila está cheia, ignora
     /// (prefetch é oportunista).
     pub fn prefetch(&self, req: Request) {
