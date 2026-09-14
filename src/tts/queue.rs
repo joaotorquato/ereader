@@ -76,11 +76,19 @@ impl Pending {
 
 pub struct TtsQueue {
     tx: mpsc::Sender<Job>,
+    shared: Arc<Shared>,
+    /// Estado que o worker expõe de volta (só leitura fora dele).
+    pub info: Info,
+}
+
+/// Separado de `TtsQueue` para que o worker NUNCA segure o `tx`: se ele
+/// guardasse um `Arc<TtsQueue>` inteiro, o canal nunca fecharia sozinho (o
+/// próprio worker manteria seu remetente vivo) e `blocking_recv` travaria
+/// para sempre no shutdown — só `kill -9` resolveria.
+struct Shared {
     waiting: Mutex<Waiters>,
     epoch: AtomicU64,
     db: Arc<Db>,
-    /// Estado que o worker expõe de volta (só leitura fora dele).
-    pub info: Info,
 }
 
 #[derive(Debug, Clone)]
@@ -103,15 +111,17 @@ impl TtsQueue {
             aligned: deps.kokoro.has_durations(),
             voices: deps.voices.list()?,
         };
-        let q = Arc::new(TtsQueue {
-            tx,
+        let shared = Arc::new(Shared {
             waiting: Mutex::new(HashMap::new()),
             epoch: AtomicU64::new(0),
             db,
+        });
+        let q = Arc::new(TtsQueue {
+            tx,
+            shared: shared.clone(),
             info,
         });
-        let worker_q = q.clone();
-        tokio::task::spawn_blocking(move || worker(deps, worker_q, rx));
+        tokio::task::spawn_blocking(move || worker(deps, shared, rx));
         Ok(q)
     }
 
@@ -120,13 +130,13 @@ impl TtsQueue {
     /// poder enfileirar prefetches DEPOIS deste job e ANTES de esperar por ele.
     pub fn request(&self, req: Request) -> Result<Pending, String> {
         let key = req.key();
-        if let Ok(Some(c)) = self.db.get_clip(&key) {
+        if let Ok(Some(c)) = self.shared.db.get_clip(&key) {
             return Ok(Pending::Ready(c));
         }
-        self.epoch.fetch_add(1, Ordering::Relaxed);
+        self.shared.epoch.fetch_add(1, Ordering::Relaxed);
         let (tx, rx) = oneshot::channel();
         let enqueue = {
-            let mut w = self.waiting.lock().unwrap();
+            let mut w = self.shared.waiting.lock().unwrap();
             match w.get_mut(&key) {
                 Some(list) => {
                     list.push(tx);
@@ -145,7 +155,7 @@ impl TtsQueue {
                 prefetch_epoch: None,
             };
             if let Err(e) = self.tx.try_send(job) {
-                self.waiting.lock().unwrap().remove(&key);
+                self.shared.waiting.lock().unwrap().remove(&key);
                 return Err(match e {
                     mpsc::error::TrySendError::Full(_) => "fila de TTS cheia".into(),
                     mpsc::error::TrySendError::Closed(_) => "worker de TTS morreu".into(),
@@ -164,11 +174,11 @@ impl TtsQueue {
     /// (prefetch é oportunista).
     pub fn prefetch(&self, req: Request) {
         let key = req.key();
-        if let Ok(Some(_)) = self.db.get_clip(&key) {
+        if let Ok(Some(_)) = self.shared.db.get_clip(&key) {
             return;
         }
         {
-            let mut w = self.waiting.lock().unwrap();
+            let mut w = self.shared.waiting.lock().unwrap();
             if w.contains_key(&key) {
                 return;
             }
@@ -177,19 +187,19 @@ impl TtsQueue {
         let job = Job {
             req,
             key: key.clone(),
-            prefetch_epoch: Some(self.epoch.load(Ordering::Relaxed)),
+            prefetch_epoch: Some(self.shared.epoch.load(Ordering::Relaxed)),
         };
         if self.tx.try_send(job).is_err() {
-            self.waiting.lock().unwrap().remove(&key);
+            self.shared.waiting.lock().unwrap().remove(&key);
         }
     }
 
     pub fn is_cached(&self, key: &str) -> Option<Clip> {
-        self.db.get_clip(key).ok().flatten()
+        self.shared.db.get_clip(key).ok().flatten()
     }
 }
 
-fn worker(mut deps: Deps, q: Arc<TtsQueue>, mut rx: mpsc::Receiver<Job>) {
+fn worker(mut deps: Deps, shared: Arc<Shared>, mut rx: mpsc::Receiver<Job>) {
     tracing::info!(
         "worker de TTS pronto (alinhamento real: {})",
         deps.kokoro.has_durations()
@@ -197,8 +207,8 @@ fn worker(mut deps: Deps, q: Arc<TtsQueue>, mut rx: mpsc::Receiver<Job>) {
     while let Some(job) = rx.blocking_recv() {
         if let Some(e) = job.prefetch_epoch {
             // prefetch velho e ninguém esperando por ele → descarta
-            let stale = e < q.epoch.load(Ordering::Relaxed);
-            let nobody = q
+            let stale = e < shared.epoch.load(Ordering::Relaxed);
+            let nobody = shared
                 .waiting
                 .lock()
                 .unwrap()
@@ -206,20 +216,20 @@ fn worker(mut deps: Deps, q: Arc<TtsQueue>, mut rx: mpsc::Receiver<Job>) {
                 .map(|v| v.is_empty())
                 .unwrap_or(true);
             if stale && nobody {
-                q.waiting.lock().unwrap().remove(&job.key);
+                shared.waiting.lock().unwrap().remove(&job.key);
                 continue;
             }
         }
         // alguém pode ter gerado enquanto estava na fila (não acontece com um worker,
         // mas custa uma query e protege contra restart com fila persistida no futuro)
-        let result = match q.db.get_clip(&job.key) {
+        let result = match shared.db.get_clip(&job.key) {
             Ok(Some(c)) => Ok(c),
-            _ => synthesize(&mut deps, &q.db, &job).map_err(|e| {
+            _ => synthesize(&mut deps, &shared.db, &job).map_err(|e| {
                 tracing::error!(key = %job.key, "síntese falhou: {e:#}");
                 format!("{e:#}")
             }),
         };
-        let waiters = q
+        let waiters = shared
             .waiting
             .lock()
             .unwrap()
