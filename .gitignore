@@ -6,3 +6,4 @@
 # Throttle e log da limpeza de disco (scripts/disk-cleanup.sh)
 /.claude/.cleanup-stamp
 /.claude/cleanup.log
+/.env
