@@ -1,0 +1,73 @@
+[package]
+name = "reader"
+version = "0.1.0"
+edition = "2021"
+description = "Leitor de PDF/EPUB com leitura em voz alta (Kokoro-82M ONNX), binário único"
+license = "MIT"
+
+[dependencies]
+# --- servidor ---
+axum = { version = "0.8", features = ["multipart", "json", "query"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "fs", "sync", "signal", "net", "time"] }
+tower-http = { version = "0.6", features = ["fs", "trace", "set-header"] }
+tower = "0.5"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+clap = { version = "4", features = ["derive", "env"] }
+rust-embed = { version = "8", features = ["compression"] }
+mime_guess = "2"
+
+# --- dados ---
+rusqlite = { version = "0.32", features = ["bundled"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["raw_value"] }
+sha2 = "0.10"
+hex = "0.4"
+
+# --- extração ---
+pdf-extract = "0.12"
+zip = { version = "2", default-features = false, features = ["deflate"] }
+roxmltree = "0.20"
+scraper = "0.21"
+percent-encoding = "2"
+
+# --- TTS ---
+# ort 2.0 rc: pinado no MESMO rc que o Kokoros compila contra (a série rc muda
+# assinaturas entre rcs — rc.13 já renomeou coisas). `download-binaries` (default)
+# baixa o ONNX Runtime pré-compilado no build (x86_64 e aarch64 linux existem).
+ort = { version = "=2.0.0-rc.11" }
+hound = "3.5"
+
+anyhow = "1"
+thiserror = "2"
+
+[features]
+default = []
+# Fonemização via libespeak-ng linkada (FFI direta). Sem esta feature o binário
+# chama o executável `espeak-ng` por processo (uma spawn por chunk, ~10 ms).
+espeak-ffi = []
+
+[dev-dependencies]
+zip = { version = "2", default-features = false, features = ["deflate"] }
+
+# Debuginfo completo de todas as dependências é o que faz target/debug passar
+# de 10G. Desligar só nas dependências mantém backtrace e step-through no
+# código deste projeto; perde-se número de linha em frames de crates de terceiros.
+[profile.dev.package."*"]
+debug = false
+
+[profile.dev]
+debug = true
+
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+strip = true
+# panic = "unwind" (default) de propósito: extract::pdf usa catch_unwind para
+# transformar panics do pdf-extract em erro 422 em vez de derrubar o processo.
+
+# O ONNX Runtime é o que pesa no binário; o resto encolhe com opt-level "z".
+# Se a inferência ficar lenta demais no Pi, troque para opt-level = 3 só no crate ort:
+# [profile.release.package.ort]
+# opt-level = 3

@@ -1,0 +1,14 @@
+{
+  "hooks": {
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "S=\"${CLAUDE_PROJECT_DIR:-.}/scripts/disk-cleanup.sh\"; [ -x \"$S\" ] && nohup bash \"$S\" </dev/null >/dev/null 2>&1 & exit 0"
+          }
+        ]
+      }
+    ]
+  }
+}

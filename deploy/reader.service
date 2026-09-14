@@ -1,0 +1,50 @@
+# /etc/systemd/system/reader.service
+#
+#   sudo useradd -r -s /usr/sbin/nologin -d /var/lib/reader reader
+#   sudo mkdir -p /var/lib/reader/{data,models} && sudo chown -R reader: /var/lib/reader
+#   sudo cp target/release/reader /usr/local/bin/reader
+#   sudo cp deploy/reader.service /etc/systemd/system/ && sudo systemctl daemon-reload
+#   sudo systemctl enable --now reader
+#
+# O token vai num arquivo só do root/reader, não no unit:
+#   echo "READER_TOKEN=$(openssl rand -hex 24)" | sudo tee /etc/reader.env && sudo chmod 600 /etc/reader.env
+
+[Unit]
+Description=Reader — leitor de e-book com TTS (Kokoro)
+After=network-online.target tailscaled.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=reader
+Group=reader
+WorkingDirectory=/var/lib/reader
+EnvironmentFile=/etc/reader.env
+Environment=READER_BIND=0.0.0.0:8080
+Environment=READER_DATA_DIR=/var/lib/reader/data
+Environment=READER_MODEL=/var/lib/reader/models/kokoro-v1.0.onnx
+Environment=READER_VOICES=/var/lib/reader/models/voices
+Environment=READER_THREADS=2
+Environment=RUST_LOG=info,ort=warn
+ExecStart=/usr/local/bin/reader
+Restart=on-failure
+RestartSec=3
+
+# Pi 5: 2 threads de inferência + tokio; deixa CPU para o resto da casa.
+CPUWeight=60
+Nice=5
+# Pico de RAM observado no Kokoro int8 fica bem abaixo disso; ajuste se usar fp32.
+MemoryMax=1G
+
+# Hardening (o processo só precisa ler modelos e escrever em data/).
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/reader/data
+PrivateTmp=true
+ProtectKernelTunables=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+
+[Install]
+WantedBy=multi-user.target

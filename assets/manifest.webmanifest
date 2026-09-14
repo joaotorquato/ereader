@@ -1,0 +1,9 @@
+{
+  "name": "Reader",
+  "short_name": "Reader",
+  "start_url": "/",
+  "display": "standalone",
+  "background_color": "#eef0ea",
+  "theme_color": "#1e4e5f",
+  "icons": [{ "src": "/icon.svg", "sizes": "any", "type": "image/svg+xml", "purpose": "any" }]
+}

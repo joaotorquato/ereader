@@ -1,0 +1,78 @@
+<!doctype html>
+<html lang="pt-BR">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="color-scheme" content="light dark">
+<meta name="theme-color" content="#eef0ea" media="(prefers-color-scheme: light)">
+<meta name="theme-color" content="#14171a" media="(prefers-color-scheme: dark)">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="apple-mobile-web-app-title" content="Reader">
+<title>Reader</title>
+<link rel="manifest" href="/manifest.webmanifest">
+<link rel="icon" href="/icon.svg" type="image/svg+xml">
+<link rel="apple-touch-icon" href="/icon.svg">
+<link rel="stylesheet" href="/style.css">
+</head>
+<body>
+
+<header>
+  <button id="back" class="icon" aria-label="Biblioteca" hidden>‹</button>
+  <h1 id="title">Reader</h1>
+  <small id="where"></small>
+  <button id="theme" class="icon" aria-label="Tema">◐</button>
+</header>
+
+<main id="main">
+  <!-- biblioteca -->
+  <section id="library" class="sheet">
+    <div class="upload">
+      <label class="btn primary">
+        <input type="file" id="file" accept=".pdf,.epub,application/pdf,application/epub+zip">
+        Enviar PDF ou EPUB
+      </label>
+      <div class="status" id="upload-status"></div>
+    </div>
+    <ul id="books" class="books"></ul>
+    <p class="empty" id="library-empty" hidden>Nenhum livro ainda. Envie um PDF ou EPUB.</p>
+  </section>
+
+  <!-- leitor -->
+  <section id="reader" class="sheet" hidden>
+    <h2 id="section-title"></h2>
+    <div id="paragraphs"></div>
+    <nav class="section-nav">
+      <button id="prev-section">‹ Seção anterior</button>
+      <button id="next-section">Próxima seção ›</button>
+    </nav>
+  </section>
+</main>
+
+<footer id="player" hidden>
+  <div class="progress"><i id="bar"></i></div>
+  <div class="transport">
+    <button id="prev" aria-label="Parágrafo anterior">⏮</button>
+    <button id="play" class="primary play" aria-label="Tocar">▶</button>
+    <button id="next" aria-label="Próximo parágrafo">⏭</button>
+  </div>
+  <div class="settings">
+    <label>Velocidade <input type="range" id="rate" min="0.6" max="1.6" step="0.1" value="1"><span id="rate-val">1.0×</span></label>
+    <label>Voz <select id="voice"></select></label>
+  </div>
+  <div class="status" id="status"></div>
+</footer>
+
+<audio id="audio" preload="auto" playsinline></audio>
+
+<dialog id="token-dialog">
+  <form method="dialog">
+    <h3>Token de acesso</h3>
+    <input id="token-input" type="password" autocomplete="current-password" placeholder="READER_TOKEN">
+    <button class="primary">Entrar</button>
+  </form>
+</dialog>
+
+<script src="/app.js"></script>
+</body>
+</html>
