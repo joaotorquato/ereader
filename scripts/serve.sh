@@ -25,11 +25,17 @@ fi
 
 [ -f .env ] || { echo "READER_TOKEN=$(openssl rand -hex 24)" > .env; chmod 600 .env; echo "gerado .env com READER_TOKEN"; }
 set -a; . ./.env; set +a
+[ "${#READER_TOKEN}" -ge 8 ] || { echo "READER_TOKEN em .env precisa ter >= 8 caracteres" >&2; exit 1; }
 [ -x target/release/reader ] || cargo build --release
 
 READER_BIND="$BIND" ./target/release/reader &
 READER_PID=$!
 trap 'kill "$READER_PID" 2>/dev/null' EXIT
+# Espera o servidor escutar (carrega o modelo ONNX antes); aborta se ele morrer.
+until curl -s -o /dev/null "http://$BIND/"; do
+  kill -0 "$READER_PID" 2>/dev/null || { echo "reader saiu antes de escutar em $BIND" >&2; exit 1; }
+  sleep 1
+done
 
 echo "https://$HOST/?token=$READER_TOKEN"
 exec cloudflared tunnel run --url "http://$BIND" "$TUNNEL"
