@@ -18,9 +18,15 @@ async fn main() -> Result<()> {
         .compact()
         .init();
 
-    let cfg = config::Config::parse();
+    let mut cfg = config::Config::parse();
     if cfg.token.len() < 8 {
         anyhow::bail!("READER_TOKEN precisa ter pelo menos 8 caracteres");
+    }
+    if cfg.pdftotext.is_none() {
+        if let Some(p) = config::detect_pdftotext_on_path() {
+            tracing::info!(path = %p.display(), "pdftotext (poppler) achado no PATH; preferindo em vez do pdf-extract puro-Rust");
+            cfg.pdftotext = Some(p);
+        }
     }
 
     std::fs::create_dir_all(&cfg.data_dir)

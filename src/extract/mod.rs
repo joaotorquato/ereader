@@ -62,8 +62,13 @@ pub fn detect_kind(filename: &str, bytes: &[u8]) -> Option<Kind> {
 }
 
 pub struct ExtractOptions<'a> {
-    /// Caminho do `pdftotext` (poppler) para fallback; `None` desliga.
+    /// Caminho do `pdftotext` (poppler) para o pipeline direto de fallback; `None` desliga.
     pub pdftotext: Option<&'a Path>,
+    /// `ebook-convert` (Calibre): todo PDF passa primeiro por aqui.
+    pub ebook_convert: &'a str,
+    /// `epubcheck` pra validar o EPUB gerado; se reprovar, tenta outra versão de EPUB
+    /// antes de desistir. `None` desliga a validação.
+    pub epubcheck: Option<&'a Path>,
 }
 
 pub fn extract(
@@ -77,7 +82,7 @@ pub fn extract(
         .map(|s| s.to_string_lossy().to_string())
         .unwrap_or_else(|| "Sem título".into());
     let mut ex = match kind {
-        Kind::Pdf => pdf::extract(bytes, opts.pdftotext)?,
+        Kind::Pdf => pdf::extract(bytes, opts)?,
         Kind::Epub => epub::extract(bytes)?,
     };
     if ex.title.trim().is_empty() {

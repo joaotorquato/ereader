@@ -68,8 +68,11 @@ pub async fn set_position(
 
 pub async fn delete(AxState(st): AxState<State>, Path(id): Path<i64>) -> ApiResult<StatusCode> {
     match st.db.delete_book(id)? {
-        Some(rel) => {
+        Some((rel, audio_paths)) => {
             let _ = std::fs::remove_file(st.cfg.data_dir.join(rel));
+            for a in audio_paths {
+                let _ = std::fs::remove_file(st.cfg.data_dir.join(a));
+            }
             Ok(StatusCode::NO_CONTENT)
         }
         None => Err(ApiError(StatusCode::NOT_FOUND, "livro não existe".into())),
@@ -114,6 +117,8 @@ pub async fn upload(
     let extracted = tokio::task::spawn_blocking(move || {
         let opts = ExtractOptions {
             pdftotext: cfg.pdftotext.as_deref(),
+            ebook_convert: &cfg.ebook_convert,
+            epubcheck: cfg.epubcheck.as_deref(),
         };
         extract::extract(kind, &fname, &bytes, &opts).map(|ex| (ex, bytes))
     })

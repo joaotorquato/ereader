@@ -51,15 +51,38 @@ pub struct Config {
     #[arg(long, env = "READER_ESPEAK_BIN", default_value = "espeak-ng")]
     pub espeak_bin: String,
 
-    /// Usar `pdftotext` (poppler) neste caminho em vez do pdf-extract
+    /// Usar `pdftotext` (poppler) neste caminho em vez do pdf-extract puro-Rust, que
+    /// engole glifos de ligadura sem ToUnicode (ex.: "Th") em alguns PDFs. Se não
+    /// setado, detecta `pdftotext` no PATH e usa automaticamente quando existir.
     #[arg(long, env = "READER_PDFTOTEXT")]
     pub pdftotext: Option<PathBuf>,
 
+    /// Calibre: todo PDF é convertido pra EPUB por aqui antes de extrair, pra ganhar
+    /// título/capítulos/h1-h6 de verdade em vez de "Página N" heurística. Binário
+    /// ausente não trava o upload — cai pro pdf-extract direto de sempre.
+    #[arg(long, env = "READER_EBOOK_CONVERT", default_value = "ebook-convert")]
+    pub ebook_convert: String,
+
+    /// `epubcheck` pra validar o EPUB gerado; se reprovar, tenta de novo com outra
+    /// versão de EPUB antes de desistir. `None` desliga a validação (usa o EPUB
+    /// gerado na primeira tentativa sem checar).
+    #[arg(long, env = "READER_EPUBCHECK")]
+    pub epubcheck: Option<PathBuf>,
+
     /// Quantos chunks à frente pré-gerar
-    #[arg(long, env = "READER_PREFETCH", default_value_t = 3)]
+    #[arg(long, env = "READER_PREFETCH", default_value_t = 4)]
     pub prefetch: usize,
 
     /// Tamanho máximo de upload em MB
     #[arg(long, env = "READER_MAX_UPLOAD_MB", default_value_t = 200)]
     pub max_upload_mb: usize,
+}
+
+/// Procura `pdftotext` nos diretórios do PATH; usado como default de `--pdftotext`
+/// quando a flag/env não foi passada.
+pub fn detect_pdftotext_on_path() -> Option<PathBuf> {
+    let path = std::env::var_os("PATH")?;
+    std::env::split_paths(&path)
+        .map(|dir| dir.join("pdftotext"))
+        .find(|p| p.is_file())
 }

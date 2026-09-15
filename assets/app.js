@@ -64,6 +64,86 @@ $("theme").onclick = () => {
   applyTheme(cur === "dark" ? "light" : "dark");
 };
 
+// -------------------------------------------------------------- settings/TOC
+const settingsDialog = $("settings-dialog");
+$("settings").onclick = () => { renderToc(); settingsDialog.showModal(); };
+settingsDialog.addEventListener("click", e => { if (e.target === settingsDialog) settingsDialog.close(); });
+
+let tocCache = new Map(); // idx da seção → sub-títulos (h2..h6) já carregados
+async function headingsFor(idx) {
+  if (tocCache.has(idx)) return tocCache.get(idx);
+  const s = await api(`/books/${st.book.id}/sections/${idx}`);
+  // idx 0 é o próprio título do capítulo (já alcançável clicando nele); o resto são sub-seções
+  const heads = s.paragraphs.filter(p => p.idx > 0 && /^h[1-6]$/.test(p.kind));
+  tocCache.set(idx, heads);
+  return heads;
+}
+
+function goToToc(idx, paraIdx = 0) {
+  settingsDialog.close();
+  stop();
+  loadSection(idx, paraIdx);
+}
+
+async function toggleChapter(body, caret, idx, forceOpen) {
+  const open = forceOpen || body.hidden;
+  body.hidden = !open;
+  caret.textContent = open ? "⌄" : "›";
+  if (!open || body.dataset.loaded) return;
+  body.dataset.loaded = "1";
+  body.textContent = "Carregando…";
+  try {
+    const heads = await headingsFor(idx);
+    body.textContent = "";
+    if (!heads.length) {
+      const e = document.createElement("small"); e.className = "toc-empty"; e.textContent = "Sem sub-seções";
+      body.appendChild(e);
+    }
+    for (const h of heads) {
+      const b = document.createElement("button");
+      b.className = "toc-heading " + h.kind;
+      b.textContent = h.text;
+      b.onclick = () => goToToc(idx, h.idx);
+      body.appendChild(b);
+    }
+  } catch {
+    body.textContent = ""; body.dataset.loaded = "";
+    const e = document.createElement("small"); e.className = "toc-empty"; e.textContent = "Erro ao carregar";
+    body.appendChild(e);
+  }
+}
+
+function renderToc() {
+  const box = $("toc");
+  box.innerHTML = "";
+  if (!st.book) { box.innerHTML = `<p class="toc-empty">Abra um livro na biblioteca.</p>`; return; }
+  let activeChap = null;
+  st.book.sections.forEach((sec, idx) => {
+    const chap = document.createElement("div");
+    chap.className = "toc-chapter" + (idx === st.sec ? " active" : "");
+
+    const head = document.createElement("div"); head.className = "toc-chapter-head";
+    const titleBtn = document.createElement("button"); titleBtn.className = "toc-title-btn";
+    titleBtn.textContent = `${idx + 1}. ${sec.title}`;
+    titleBtn.onclick = () => goToToc(idx);
+    const caret = document.createElement("button"); caret.className = "toc-caret"; caret.setAttribute("aria-label", "Expandir");
+    caret.textContent = "›";
+    head.append(titleBtn, caret);
+
+    const body = document.createElement("div"); body.className = "toc-sections"; body.hidden = true;
+    caret.onclick = () => toggleChapter(body, caret, idx);
+
+    chap.append(head, body);
+    box.appendChild(chap);
+    if (idx === st.sec) activeChap = { chap, body, caret };
+  });
+  // sempre mostra onde o usuário está agora; role a lista pra cima pra ver os demais capítulos
+  if (activeChap) {
+    toggleChapter(activeChap.body, activeChap.caret, st.sec, true);
+    requestAnimationFrame(() => activeChap.chap.scrollIntoView({ block: "center" }));
+  }
+}
+
 // ------------------------------------------------------------------ state
 const st = {
   book: null,          // {id, title, lang, sections:[{id,idx,title}], pos_section, pos_paragraph}
@@ -83,7 +163,7 @@ const voice = () => $("voice").value || "";
 async function showLibrary() {
   stop();
   st.book = null;
-  $("reader").hidden = true; $("player").hidden = true; $("back").hidden = true;
+  $("reader").hidden = true; $("player").hidden = true; $("progress").hidden = true; $("back").hidden = true;
   $("library").hidden = false;
   $("title").textContent = "Reader"; $("where").textContent = "";
   const books = await api("/books");
@@ -118,7 +198,8 @@ $("file").onchange = async e => {
 async function openBook(id) {
   stop();
   st.book = await api(`/books/${id}`);
-  $("library").hidden = true; $("reader").hidden = false; $("player").hidden = false; $("back").hidden = false;
+  tocCache = new Map();
+  $("library").hidden = true; $("reader").hidden = false; $("player").hidden = false; $("progress").hidden = false; $("back").hidden = false;
   $("title").textContent = st.book.title;
   await fillVoices();
   await loadSection(st.book.pos_section, st.book.pos_paragraph);
@@ -129,7 +210,6 @@ async function loadSection(idx, scrollToPara = 0) {
   idx = Math.max(0, Math.min(idx, st.book.sections.length - 1));
   const s = await api(`/books/${st.book.id}/sections/${idx}`);
   st.sec = idx; st.paras = s.paragraphs; st.para = -1;
-  $("section-title").textContent = s.title;
   $("where").textContent = `${idx + 1} / ${st.book.sections.length}`;
   $("bar").style.width = ((idx + 1) / st.book.sections.length * 100) + "%";
   $("prev-section").disabled = idx === 0;
@@ -163,6 +243,34 @@ const paraEl = idx => document.querySelector(`.para[data-p="${idx}"]`);
 
 $("prev-section").onclick = () => { stop(); loadSection(st.sec - 1); };
 $("next-section").onclick = () => { stop(); loadSection(st.sec + 1); };
+
+// touch: os botões de seção somem (CSS, pointer:coarse); toque na borda ou
+// arrasto horizontal troca de seção em qualquer altura da página.
+if (matchMedia("(pointer: coarse)").matches) {
+  const goSection = d => {
+    if (!st.book || $("reader").hidden) return false;
+    const target = st.sec + d;
+    if (target < 0 || target >= st.book.sections.length) return false;
+    stop(); loadSection(target);
+    return true;
+  };
+  let tx = 0, ty = 0, tt = 0;
+  $("main").addEventListener("touchstart", e => {
+    const t = e.touches[0]; tx = t.clientX; ty = t.clientY; tt = Date.now();
+  }, { passive: true });
+  $("main").addEventListener("touchend", e => {
+    const t = e.changedTouches[0];
+    const dx = t.clientX - tx, dy = t.clientY - ty;
+    const edge = Math.min(72, innerWidth * 0.15);
+    let moved;
+    if (Math.abs(dx) > 70 && Math.abs(dx) > Math.abs(dy) * 1.5) moved = goSection(dx < 0 ? 1 : -1);
+    else if (Date.now() - tt < 500 && Math.abs(dx) < 10 && Math.abs(dy) < 10) {
+      if (t.clientX < edge) moved = goSection(-1);
+      else if (t.clientX > innerWidth - edge) moved = goSection(1);
+    }
+    if (moved) e.preventDefault();
+  });
+}
 
 let posTimer = null;
 function savePosition() {
@@ -235,13 +343,40 @@ function nextParagraph(g) {
   st.webSpeech ? speakParaWeb(g) : speakPara(g);
 }
 
+/** Lista de chunks + download em pipeline de um parágrafo. Guardado em
+ *  st.prep pra começar o parágrafo seguinte enquanto o atual ainda toca
+ *  (consumido uma vez em speakPara — os object URLs são revogados ao tocar). */
+function prepPara(p) {
+  const q = `voice=${encodeURIComponent(voice())}&speed=${rate()}`;
+  if (st.prep && st.prep.id === p.id && st.prep.q === q) return st.prep.job;
+  const job = (async () => {
+    const list = await api(`/clips?paragraph=${p.id}&${q}`);
+    const prepared = list.chunks.map(() => null);
+    const prepare = async k => {
+      if (prepared[k]) return prepared[k];
+      prepared[k] = (async () => {
+        const c = list.chunks[k];
+        const meta = c.clip || await api(`/clips/${c.key}?paragraph=${p.id}&chunk=${c.idx}&${q}`);
+        const blob = await (await fetch(meta.url, { headers: { Authorization: "Bearer " + token } })).blob();
+        return { meta, url: URL.createObjectURL(blob), offset: c.offset };
+      })();
+      return prepared[k];
+    };
+    if (list.chunks.length) prepare(0).catch(() => {});
+    return { list, prepare };
+  })();
+  st.prep = { id: p.id, q, job };
+  return job;
+}
+
 /** Toca um parágrafo inteiro: pede a lista de chunks e encadeia. */
 async function speakPara(g) {
   const p = st.paras[st.para];
   if (!p) return;
-  const q = `voice=${encodeURIComponent(voice())}&speed=${rate()}`;
-  let list;
-  try { list = await api(`/clips?paragraph=${p.id}&${q}`); }
+  const job = prepPara(p);
+  st.prep = null;
+  let list, prepare;
+  try { ({ list, prepare } = await job); }
   catch (err) {
     if (err.status === 503 && "speechSynthesis" in window) {
       setStatus("TTS do servidor indisponível — usando voz do aparelho");
@@ -252,22 +387,6 @@ async function speakPara(g) {
   if (g !== st.gen) return;
   if (!list.chunks.length) return nextParagraph(g);
 
-  const clipFor = async (c) => {
-    if (c.clip) return c.clip;
-    return api(`/clips/${c.key}?paragraph=${p.id}&chunk=${c.idx}&${q}`);
-  };
-  // pipeline: meta+blob do chunk k já enquanto o k-1 toca
-  const prepared = list.chunks.map(() => null);
-  const prepare = async k => {
-    if (prepared[k]) return prepared[k];
-    prepared[k] = (async () => {
-      const meta = await clipFor(list.chunks[k]);
-      const blob = await (await fetch(meta.url, { headers: { Authorization: "Bearer " + token } })).blob();
-      return { meta, url: URL.createObjectURL(blob), offset: list.chunks[k].offset };
-    })();
-    return prepared[k];
-  };
-
   for (let k = 0; k < list.chunks.length; k++) {
     if (g !== st.gen) return;
     if (k === 0) setStatus("Gerando áudio…");
@@ -275,7 +394,9 @@ async function speakPara(g) {
     try { clip = await prepare(k); } catch (err) { setStatus("Erro no áudio: " + err.message); stop(); return; }
     if (g !== st.gen) { URL.revokeObjectURL(clip.url); return; }
     setStatus("");
+    // pipeline: chunk k+1 deste parágrafo, ou o parágrafo seguinte inteiro
     if (k + 1 < list.chunks.length) prepare(k + 1).catch(() => {});
+    else if (st.paras[st.para + 1]) prepPara(st.paras[st.para + 1]).catch(() => {});
     await playClip(g, p.idx, clip);
     URL.revokeObjectURL(clip.url);
     if (g !== st.gen) return;
@@ -326,7 +447,6 @@ function speakParaWeb(g) {
 $("play").onclick = () => st.playing ? stop() : play();
 $("next").onclick = () => { stop(); st.para = Math.min(st.para + 1, st.paras.length - 1); play(); };
 $("prev").onclick = () => { stop(); st.para = Math.max(0, st.para - 1); play(); };
-$("rate").oninput = e => { $("rate-val").textContent = (+e.target.value).toFixed(1) + "×"; };
 $("rate").onchange = () => { if (st.playing) { const p = st.para; stop(); st.para = p; play(); } };
 $("voice").onchange = () => { localStorage.setItem("voice:" + (st.book?.lang || ""), voice()); if (st.playing) { const p = st.para; stop(); st.para = p; play(); } };
 

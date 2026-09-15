@@ -6,9 +6,11 @@
 //! handler async é aceitável (não há await com o lock preso). Se um dia isso virar
 //! gargalo, o caminho é `spawn_blocking` + pool, não async-sqlite.
 
+use crate::tts::chunk;
 use anyhow::{Context, Result};
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::Serialize;
+use std::collections::HashSet;
 use std::path::Path;
 use std::sync::Mutex;
 
@@ -161,20 +163,57 @@ impl Db {
             .optional()?)
     }
 
-    /// Remove o livro (cascade em seções/parágrafos) e devolve o caminho do arquivo original.
-    pub fn delete_book(&self, id: i64) -> Result<Option<String>> {
-        let conn = self.conn.lock().unwrap();
-        let path: Option<String> = conn
+    /// Remove o livro (cascade em seções/parágrafos) e os clips de TTS que só ele usava.
+    /// Devolve o caminho do arquivo original e os caminhos (relativos) dos .wav a apagar.
+    ///
+    /// `clips` é indexado por sha256(texto do chunk + voz + speed), sem `book_id` — de
+    /// propósito, pra dois livros com o mesmo trecho compartilharem o áudio. Isso significa
+    /// que apagar um livro cujo texto colide com outro livro derruba o clip do outro também;
+    /// ponytail: aceitável, porque é auto-curável — na próxima leitura o worker resintetiza
+    /// no cache-miss. Upgrade se algum dia isso doer: tabela paragraph_clips com refcount.
+    pub fn delete_book(&self, id: i64) -> Result<Option<(String, Vec<String>)>> {
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction()?;
+        let path: Option<String> = tx
             .query_row(
                 "SELECT file_path FROM books WHERE id = ?1",
                 params![id],
                 |r| r.get(0),
             )
             .optional()?;
-        if path.is_some() {
-            conn.execute("DELETE FROM books WHERE id = ?1", params![id])?;
+        let Some(path) = path else {
+            return Ok(None);
+        };
+
+        let mut texts = HashSet::new();
+        {
+            let mut sel = tx.prepare(
+                "SELECT p.text FROM paragraphs p
+                 JOIN sections s ON s.id = p.section_id
+                 WHERE s.book_id = ?1",
+            )?;
+            let mut rows = sel.query(params![id])?;
+            while let Some(r) = rows.next()? {
+                let text: String = r.get(0)?;
+                for c in chunk::split(&text) {
+                    texts.insert(c.text);
+                }
+            }
         }
-        Ok(path)
+
+        let mut audio_paths = Vec::new();
+        for t in &texts {
+            let mut sel = tx.prepare("SELECT path FROM clips WHERE text = ?1")?;
+            let mut rows = sel.query(params![t])?;
+            while let Some(r) = rows.next()? {
+                audio_paths.push(r.get::<_, String>(0)?);
+            }
+            tx.execute("DELETE FROM clips WHERE text = ?1", params![t])?;
+        }
+
+        tx.execute("DELETE FROM books WHERE id = ?1", params![id])?;
+        tx.commit()?;
+        Ok(Some((path, audio_paths)))
     }
 
     pub fn touch_book(&self, id: i64) -> Result<()> {
@@ -320,6 +359,56 @@ impl Db {
             params![key, text, voice, speed as f64, lang, path, duration_ms, word_timings_json, aligned as i64],
         )?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::extract::{Paragraph as ExPar, Section as ExSec};
+
+    fn book_with_paragraph(db: &Db, text: &str) -> i64 {
+        db.insert_book(
+            "Livro",
+            "pt-BR",
+            "epub",
+            "books/livro.epub",
+            &[ExSec {
+                title: "Seção 1".into(),
+                paragraphs: vec![ExPar {
+                    kind: "p".into(),
+                    text: text.into(),
+                }],
+            }],
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn apagar_livro_remove_so_os_clips_dele() {
+        let db = Db::open(Path::new(":memory:")).unwrap();
+        let a = book_with_paragraph(&db, "Frase do livro A.");
+        let b = book_with_paragraph(&db, "Frase do livro B, diferente.");
+
+        db.insert_clip("keyA", "Frase do livro A.", "v", 1.0, "pt-br", "audio/aa/keyA.wav", 100, "[]", false)
+            .unwrap();
+        db.insert_clip("keyB", "Frase do livro B, diferente.", "v", 1.0, "pt-br", "audio/bb/keyB.wav", 100, "[]", false)
+            .unwrap();
+
+        let (file_path, audio_paths) = db.delete_book(a).unwrap().unwrap();
+        assert_eq!(file_path, "books/livro.epub");
+        assert_eq!(audio_paths, vec!["audio/aa/keyA.wav"]);
+
+        assert!(db.get_clip("keyA").unwrap().is_none(), "clip do livro apagado deve sumir");
+        assert!(db.get_clip("keyB").unwrap().is_some(), "clip de outro livro deve sobreviver");
+        assert!(db.get_book(a).unwrap().is_none());
+        assert!(db.get_book(b).unwrap().is_some());
+    }
+
+    #[test]
+    fn apagar_livro_inexistente_nao_erra() {
+        let db = Db::open(Path::new(":memory:")).unwrap();
+        assert!(db.delete_book(999).unwrap().is_none());
     }
 }
 

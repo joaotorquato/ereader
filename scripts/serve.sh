@@ -26,7 +26,7 @@ fi
 [ -f .env ] || { echo "READER_TOKEN=$(openssl rand -hex 24)" > .env; chmod 600 .env; echo "gerado .env com READER_TOKEN"; }
 set -a; . ./.env; set +a
 [ "${#READER_TOKEN}" -ge 8 ] || { echo "READER_TOKEN em .env precisa ter >= 8 caracteres" >&2; exit 1; }
-[ -x target/release/reader ] || cargo build --release
+cargo build --release
 
 READER_BIND="$BIND" ./target/release/reader &
 READER_PID=$!

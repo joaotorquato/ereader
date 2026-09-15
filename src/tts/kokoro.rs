@@ -164,6 +164,71 @@ impl Kokoro {
     }
 }
 
+/// O `speed` do Kokoro é um único escalar que o grafo ONNX aplica a TODAS as
+/// durations previstas (fonemas e pontuação/espaço juntos) — não dá pra pedir
+/// ao modelo pra acelerar só a fala. Aqui devolvemos as pausas de pontuação
+/// e espaço pra duração que teriam em speed=1, mexendo só no áudio já gerado
+/// (sem re-inferir): repete os samples que a própria pausa já tem até completar
+/// a duração natural (ou corta, se speed<1 tiver alongado). A fala em si fica
+/// intocada, na velocidade pedida. Exige o modelo "timestamped" (`durations`).
+pub fn restore_pause_speed(out: &Synth, speed: f32) -> (Vec<f32>, Option<Vec<f32>>) {
+    let Some(durations) = out.durations.as_deref() else {
+        return (out.samples.clone(), None);
+    };
+    if (speed - 1.0).abs() < 1e-3 || durations.len() != out.token_ids.len() {
+        return (out.samples.clone(), Some(durations.to_vec()));
+    }
+    let total_frames: f32 = durations.iter().sum();
+    if total_frames <= 0.0 {
+        return (out.samples.clone(), Some(durations.to_vec()));
+    }
+    // samples/frame calculado do próprio áudio (não chumbado) — robusto a
+    // mudanças de hop length entre exports do modelo.
+    let samples_per_frame = (out.samples.len() as f64 / total_frames as f64)
+        .round()
+        .max(1.0) as usize;
+    let space_id = vocab::vocab()[&' '];
+    let punct_ids = vocab::punct_ids();
+    let n = out.token_ids.len();
+
+    let mut samples = Vec::with_capacity(out.samples.len());
+    let mut out_durations = Vec::with_capacity(durations.len());
+    let mut cursor = 0usize;
+    for (i, &fr) in durations.iter().enumerate() {
+        let observed = (fr.round().max(0.0) as usize).saturating_mul(samples_per_frame);
+        let start = cursor.min(out.samples.len());
+        let end = (start + observed).min(out.samples.len());
+        cursor = end;
+        let seg = &out.samples[start..end];
+
+        let is_pause =
+            i == 0 || i == n - 1 || out.token_ids[i] == space_id || punct_ids.contains(&out.token_ids[i]);
+        if !is_pause || seg.is_empty() {
+            samples.extend_from_slice(seg);
+            out_durations.push(fr);
+            continue;
+        }
+
+        let natural_len =
+            ((fr * speed).round().max(0.0) as usize).saturating_mul(samples_per_frame);
+        if natural_len >= seg.len() {
+            samples.extend_from_slice(seg);
+            let extra = natural_len - seg.len();
+            samples.extend((0..extra).map(|k| seg[k % seg.len()]));
+        } else {
+            samples.extend_from_slice(&seg[..natural_len]);
+        }
+        // grava o MESMO valor arredondado usado no áudio, não `fr * speed` cru —
+        // senão o erro de arredondamento (até meio frame) se acumula a cada
+        // pausa/espaço do parágrafo inteiro e o highlight dessincroniza do áudio.
+        out_durations.push(natural_len as f32 / samples_per_frame as f32);
+    }
+    if cursor < out.samples.len() {
+        samples.extend_from_slice(&out.samples[cursor..]);
+    }
+    (samples, Some(out_durations))
+}
+
 /// f32 → WAV 16-bit PCM mono 24 kHz. 16 bits em vez de f32 porque o Safari toca
 /// os dois mas o arquivo fica metade do tamanho; e o Kokoro não tem 24 bits de
 /// informação de qualquer jeito.
@@ -187,4 +252,83 @@ pub fn write_wav(path: &Path, samples: &[f32]) -> Result<u32> {
 
 pub fn duration_ms(n_samples: usize) -> u32 {
     ((n_samples as u64) * 1000 / SAMPLE_RATE as u64) as u32
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// "aa ." tokenizado: [pad, a, a, espaço, ponto, pad], 2 samples/frame.
+    /// samples[i] = i, pra rastrear exatamente o que foi preservado vs. repetido.
+    fn synth_fixture() -> Synth {
+        let v = vocab::vocab();
+        let token_ids = vec![0, v[&'a'], v[&'a'], v[&' '], v[&'.'], 0];
+        let durations = vec![2.0, 10.0, 10.0, 4.0, 6.0, 2.0]; // soma 34 * 2 samples/frame = 68
+        let samples = (0..68).map(|i| i as f32).collect();
+        Synth {
+            samples,
+            token_ids,
+            durations: Some(durations),
+        }
+    }
+
+    #[test]
+    fn restaura_pausas_e_preserva_fala_ao_dobrar_a_velocidade() {
+        let s = synth_fixture();
+        let (samples, durations) = restore_pause_speed(&s, 2.0);
+        let durations = durations.unwrap();
+
+        // pausas (pads, espaço, ponto) voltam à duração natural (fr * speed)
+        assert_eq!(durations, vec![4.0, 10.0, 10.0, 8.0, 12.0, 4.0]);
+        // fala (as duas ocorrências de "a") fica intocada, byte a byte
+        assert_eq!(&samples[8..28], &s.samples[4..24]);
+        assert_eq!(&samples[28..48], &s.samples[24..44]);
+        // pausa do espaço: 8 samples originais (44..52) + os mesmos 8 repetidos
+        assert_eq!(&samples[48..56], &s.samples[44..52]);
+        assert_eq!(&samples[56..64], &s.samples[44..52]);
+        assert_eq!(samples.len(), 96);
+    }
+
+    /// Regressão: durations fracionárias (o caso real — o modelo não prevê só
+    /// inteiros) não podem gravar o valor cru `fr*speed` no timing, senão o
+    /// arredondamento do áudio (que É inteiro, em samples) diverge da métrica
+    /// usada pro highlight — e diverge de novo a cada pausa do parágrafo,
+    /// acumulando até o highlight terminar bem antes do áudio.
+    #[test]
+    fn duration_da_pausa_bate_com_o_arredondamento_usado_no_audio() {
+        let v = vocab::vocab();
+        let token_ids = vec![0, v[&'a'], v[&' '], v[&'a'], 0];
+        // pausa central com 3.0 frames; a 1.3x soaria 3.9 frames — sem o fix,
+        // isso é o que ia pro JSON de timing, mas o áudio só tem os 4 frames
+        // (2 samples/frame) redondos que de fato foram inseridos.
+        let durations = vec![2.0, 5.0, 3.0, 5.0, 2.0];
+        let samples = (0..34).map(|i| i as f32).collect();
+        let s = Synth { samples, token_ids, durations: Some(durations) };
+
+        let (samples, durations) = restore_pause_speed(&s, 1.3);
+        let durations = durations.unwrap();
+
+        assert_eq!(durations[2], 4.0, "3.0 * 1.3 = 3.9 → arredonda pra 4 frames, não fica cru em 3.9");
+        // a duration gravada tem que corresponder exatamente aos samples entregues
+        let samples_per_frame = 2;
+        let total: f32 = durations.iter().sum();
+        assert_eq!((total * samples_per_frame as f32).round() as usize, samples.len());
+    }
+
+    #[test]
+    fn nao_mexe_em_nada_quando_speed_e_1() {
+        let s = synth_fixture();
+        let (samples, durations) = restore_pause_speed(&s, 1.0);
+        assert_eq!(samples, s.samples);
+        assert_eq!(durations.unwrap(), *s.durations.as_ref().unwrap());
+    }
+
+    #[test]
+    fn sem_durations_do_modelo_devolve_amostras_como_vieram() {
+        let mut s = synth_fixture();
+        s.durations = None;
+        let (samples, durations) = restore_pause_speed(&s, 1.5);
+        assert_eq!(samples, s.samples);
+        assert!(durations.is_none());
+    }
 }

@@ -5,7 +5,7 @@
 //! embeddings do modelo. Repare que `'` aparece duas vezes na string original
 //! (em volta do U+0329); em Python "o último vence", e fazemos igual aqui.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::OnceLock;
 
 const PAD: &str = "$";
@@ -25,6 +25,20 @@ pub fn vocab() -> &'static HashMap<char, i64> {
             m.insert(c, i as i64); // último vence, como no dict() do Python
         }
         m
+    })
+}
+
+/// Ids de pontuação de pausa (`;:,.!?` etc, sem o espaço) — usado em
+/// queue.rs para achar, no áudio já gerado, onde restaurar a duração
+/// natural das pausas quando `speed != 1`.
+pub fn punct_ids() -> &'static HashSet<i64> {
+    static P: OnceLock<HashSet<i64>> = OnceLock::new();
+    P.get_or_init(|| {
+        let v = vocab();
+        ";:,.!?¡¿—…\"«»“”"
+            .chars()
+            .filter_map(|c| v.get(&c).copied())
+            .collect()
     })
 }
 

@@ -18,10 +18,27 @@
 <body>
 
 <header>
-  <button id="back" class="icon" aria-label="Biblioteca" hidden>‹</button>
-  <h1 id="title">Reader</h1>
-  <small id="where"></small>
-  <button id="theme" class="icon" aria-label="Tema">◐</button>
+  <div class="row">
+    <div class="left">
+      <button id="back" class="icon" aria-label="Biblioteca" hidden>‹</button>
+      <h1 id="title">Reader</h1>
+    </div>
+    <div id="player" class="controls" hidden>
+      <button id="prev" class="icon" aria-label="Parágrafo anterior">⏮</button>
+      <button id="play" class="icon primary" aria-label="Tocar">▶</button>
+      <button id="next" class="icon" aria-label="Próximo parágrafo">⏭</button>
+      <select id="rate" aria-label="Velocidade">
+        <option value="1">1×</option>
+        <option value="1.25">1.25×</option>
+        <option value="1.5">1.5×</option>
+        <option value="1.75">1.75×</option>
+        <option value="2">2×</option>
+      </select>
+      <select id="voice" aria-label="Voz"></select>
+    </div>
+    <button id="settings" class="icon" aria-label="Menu">☰</button>
+  </div>
+  <div class="progress" id="progress"><i id="bar"></i></div>
 </header>
 
 <main id="main">
@@ -40,28 +57,17 @@
 
   <!-- leitor -->
   <section id="reader" class="sheet" hidden>
-    <h2 id="section-title"></h2>
     <div id="paragraphs"></div>
+    <div class="section-footer">
+      <span class="status" id="status"></span>
+      <small id="where"></small>
+    </div>
     <nav class="section-nav">
       <button id="prev-section">‹ Seção anterior</button>
       <button id="next-section">Próxima seção ›</button>
     </nav>
   </section>
 </main>
-
-<footer id="player" hidden>
-  <div class="progress"><i id="bar"></i></div>
-  <div class="transport">
-    <button id="prev" aria-label="Parágrafo anterior">⏮</button>
-    <button id="play" class="primary play" aria-label="Tocar">▶</button>
-    <button id="next" aria-label="Próximo parágrafo">⏭</button>
-  </div>
-  <div class="settings">
-    <label>Velocidade <input type="range" id="rate" min="0.6" max="1.6" step="0.1" value="1"><span id="rate-val">1.0×</span></label>
-    <label>Voz <select id="voice"></select></label>
-  </div>
-  <div class="status" id="status"></div>
-</footer>
 
 <audio id="audio" preload="auto" playsinline></audio>
 
@@ -71,6 +77,14 @@
     <input id="token-input" type="password" autocomplete="current-password" placeholder="READER_TOKEN">
     <button class="primary">Entrar</button>
   </form>
+</dialog>
+
+<dialog id="settings-dialog">
+  <div class="settings-head">
+    <h3>Menu</h3>
+    <button id="theme" class="icon" aria-label="Tema">◐</button>
+  </div>
+  <div id="toc" class="toc"></div>
 </dialog>
 
 <script src="/app.js"></script>

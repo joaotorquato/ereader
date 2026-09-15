@@ -16,7 +16,10 @@ self.addEventListener("fetch", e => {
   // network-first para o shell (é local, rápido; e sempre pega a versão nova),
   // cache como fallback offline
   e.respondWith(
-    fetch(e.request).then(r => { const copy = r.clone(); caches.open(SHELL).then(c => c.put(e.request, copy)); return r; })
-      .catch(() => caches.match(e.request))
+    fetch(e.request).then(r => {
+      // só guarda resposta boa: um 530 do túnel caído não pode virar o "CSS" offline
+      if (r.ok) { const copy = r.clone(); caches.open(SHELL).then(c => c.put(e.request, copy)); }
+      return r;
+    }).catch(() => caches.match(e.request))
   );
 });

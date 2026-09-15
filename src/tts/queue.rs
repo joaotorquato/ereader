@@ -45,6 +45,9 @@ impl Request {
         h.update(self.voice.as_bytes());
         h.update([0u8]);
         h.update(format!("{:.2}", self.speed).as_bytes());
+        // Bump quando a síntese muda pra clips antigos não serem reaproveitados
+        // (v2: pontuação passou a chegar no modelo — pausas/prosódia diferentes).
+        h.update(b"\0v2");
         hex::encode(h.finalize())
     }
 }
@@ -52,10 +55,18 @@ impl Request {
 struct Job {
     req: Request,
     key: String,
-    prefetch_epoch: Option<u64>, // Some(e) = prefetch enfileirado na epoch e
 }
 
-type Waiters = HashMap<String, Vec<oneshot::Sender<Result<Clip, String>>>>;
+/// Um pedido na fila: quem espera por ele e, se é prefetch, a epoch em que foi
+/// pedido pela ÚLTIMA vez. Fica aqui (e não no `Job`) para um prefetch
+/// re-pedido enquanto ainda está na fila continuar fresco — senão cada pedido
+/// real invalidava os N-1 prefetches atrás dele e o pipeline caía pra 1.
+struct Entry {
+    waiters: Vec<oneshot::Sender<Result<Clip, String>>>,
+    prefetch_epoch: Option<u64>,
+}
+
+type Waiters = HashMap<String, Entry>;
 
 pub enum Pending {
     Ready(Clip),
@@ -138,22 +149,19 @@ impl TtsQueue {
         let enqueue = {
             let mut w = self.shared.waiting.lock().unwrap();
             match w.get_mut(&key) {
-                Some(list) => {
-                    list.push(tx);
+                Some(e) => {
+                    e.waiters.push(tx);
+                    e.prefetch_epoch = None; // virou pedido real
                     false
                 }
                 None => {
-                    w.insert(key.clone(), vec![tx]);
+                    w.insert(key.clone(), Entry { waiters: vec![tx], prefetch_epoch: None });
                     true
                 }
             }
         };
         if enqueue {
-            let job = Job {
-                req,
-                key: key.clone(),
-                prefetch_epoch: None,
-            };
+            let job = Job { req, key: key.clone() };
             if let Err(e) = self.tx.try_send(job) {
                 self.shared.waiting.lock().unwrap().remove(&key);
                 return Err(match e {
@@ -172,18 +180,18 @@ impl TtsQueue {
         if let Ok(Some(_)) = self.shared.db.get_clip(&key) {
             return;
         }
+        let epoch = self.shared.epoch.load(Ordering::Relaxed);
         {
             let mut w = self.shared.waiting.lock().unwrap();
-            if w.contains_key(&key) {
+            if let Some(e) = w.get_mut(&key) {
+                if let Some(pe) = e.prefetch_epoch.as_mut() {
+                    *pe = epoch; // já na fila: só renova
+                }
                 return;
             }
-            w.insert(key.clone(), Vec::new());
+            w.insert(key.clone(), Entry { waiters: Vec::new(), prefetch_epoch: Some(epoch) });
         }
-        let job = Job {
-            req,
-            key: key.clone(),
-            prefetch_epoch: Some(self.shared.epoch.load(Ordering::Relaxed)),
-        };
+        let job = Job { req, key: key.clone() };
         if self.tx.try_send(job).is_err() {
             self.shared.waiting.lock().unwrap().remove(&key);
         }
@@ -200,18 +208,16 @@ fn worker(mut deps: Deps, shared: Arc<Shared>, mut rx: mpsc::Receiver<Job>) {
         deps.kokoro.has_durations()
     );
     while let Some(job) = rx.blocking_recv() {
-        if let Some(e) = job.prefetch_epoch {
-            // prefetch velho e ninguém esperando por ele → descarta
-            let stale = e < shared.epoch.load(Ordering::Relaxed);
-            let nobody = shared
-                .waiting
-                .lock()
-                .unwrap()
+        {
+            // prefetch velho (ninguém re-pediu desde o último pedido real) → descarta
+            let mut w = shared.waiting.lock().unwrap();
+            let stale = w
                 .get(&job.key)
-                .map(|v| v.is_empty())
-                .unwrap_or(true);
-            if stale && nobody {
-                shared.waiting.lock().unwrap().remove(&job.key);
+                .and_then(|e| e.prefetch_epoch)
+                .map(|e| e < shared.epoch.load(Ordering::Relaxed))
+                .unwrap_or(false);
+            if stale {
+                w.remove(&job.key);
                 continue;
             }
         }
@@ -229,6 +235,7 @@ fn worker(mut deps: Deps, shared: Arc<Shared>, mut rx: mpsc::Receiver<Job>) {
             .lock()
             .unwrap()
             .remove(&job.key)
+            .map(|e| e.waiters)
             .unwrap_or_default();
         for w in waiters {
             let _ = w.send(result.clone());
@@ -251,16 +258,18 @@ fn synthesize(deps: &mut Deps, db: &Db, job: &Job) -> Result<Clip> {
     let out = deps
         .kokoro
         .synth(&ph.phonemes, |n| voices.style(&voice, n), req.speed)?;
+    // speed do Kokoro acelera fala e pausas juntas; devolve só as pausas ao natural.
+    let (samples, durations) = kokoro::restore_pause_speed(&out, req.speed);
 
     let rel = format!("audio/{}/{}.wav", &job.key[..2], job.key);
     let abs = deps.data_dir.join(&rel);
     std::fs::create_dir_all(abs.parent().unwrap())?;
     let tmp = abs.with_extension("wav.tmp");
-    let duration_ms = kokoro::write_wav(&tmp, &out.samples)?;
+    let duration_ms = kokoro::write_wav(&tmp, &samples)?;
     std::fs::rename(&tmp, &abs).context("renomeando wav")?;
 
     let space_id = super::vocab::vocab()[&' '];
-    let durations = out.durations.as_deref().map(|d| timing::Durations {
+    let durations = durations.as_deref().map(|d| timing::Durations {
         per_token: d,
         token_ids: &out.token_ids,
         space_id,

@@ -227,7 +227,7 @@ impl Cli {
 
     fn run(&self, lines: &[String], lang: Lang) -> Result<Vec<String>> {
         let mut child = Command::new(&self.bin)
-            .args(["-q", "--ipa", "-v", lang.espeak_voice(), "--stdin"])
+            .args(["-q", "--ipa", "-v", lang.espeak_voice()])
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::null())

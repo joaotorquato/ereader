@@ -26,8 +26,18 @@ falada e posição lembrada por livro. Um executável, SQLite, sem Python.
 * `espeak-ng` instalado no host (`apt install espeak-ng`). É o fonemizador; o
   binário chama `espeak-ng --ipa` por chunk. (Alternativa: feature `espeak-ffi`
   linka `libespeak-ng` — precisa de `libespeak-ng-dev`; ver nota abaixo.)
-* Opcional: `poppler-utils` para `--pdftotext /usr/bin/pdftotext` (melhor em PDF
-  de duas colunas).
+* `calibre` instalado no host (`ebook-convert` no PATH): todo PDF é convertido pra
+  EPUB antes de extrair (título/capítulos/h1-h6 de verdade em vez de "Página N").
+  Se o binário não existir, cai pro pdf-extract direto de sempre — não trava o upload.
+* Recomendado: `poppler-utils` (`apt install poppler-utils` / `brew install poppler`).
+  Usado no fallback direto (quando a conversão pra EPUB falha) em vez do
+  `pdf-extract` puro-Rust, que engole glifos de ligadura sem ToUnicode (ex.: "Th")
+  em alguns PDFs e é pior em PDF de duas colunas. Detectado e usado automaticamente
+  se `pdftotext` estiver no PATH; passe `--pdftotext` só pra forçar outro caminho.
+* Opcional: `epubcheck` (`--epubcheck /caminho/epubcheck`) pra validar o EPUB gerado.
+  Se reprovar, tenta de novo com outra versão de EPUB (2 → 3) antes de desistir e cair
+  pro fallback direto; sem `epubcheck` configurado, o EPUB da primeira conversão é
+  usado sem checar.
 * Modelo + vozes: `./scripts/download-models.sh` (≈ 92 MB + 0,5 MB por voz).
 
 ## Build local (x86_64)
@@ -104,8 +114,10 @@ Toda flag tem ENV equivalente (`reader --help`):
 | `--threads` | `READER_THREADS` | `2` |
 | `--voice-en` / `--voice-pt` | `READER_VOICE_EN` / `_PT` | `af_heart` / `pf_dora` |
 | `--espeak-bin` | `READER_ESPEAK_BIN` | `espeak-ng` |
-| `--pdftotext` | `READER_PDFTOTEXT` | (desligado) |
-| `--prefetch` | `READER_PREFETCH` | `3` |
+| `--pdftotext` | `READER_PDFTOTEXT` | detecta `pdftotext` no PATH; senão usa `pdf-extract` puro-Rust |
+| `--ebook-convert` | `READER_EBOOK_CONVERT` | `ebook-convert` |
+| `--epubcheck` | `READER_EPUBCHECK` | (desligado) |
+| `--prefetch` | `READER_PREFETCH` | `4` |
 
 ## API (para debugar com curl)
 
