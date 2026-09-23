@@ -10,11 +10,16 @@
 //!     esta feature aqui (sem libespeak no ambiente de build), trate como rascunho.
 //!
 //! Pontuação: o espeak descarta pontuação na saída de fonemas, mas o Kokoro usa
-//! ela para prosódia/pausas. Fazemos o que a lib `phonemizer` (usada pelo Kokoro
-//! original) faz com `preserve_punctuation=True`: quebramos o texto em segmentos
-//! nas pontuações, fonemizamos cada segmento como uma linha, e reinserimos a
-//! pontuação entre eles. Como bônus, os espaços entre palavras sobrevivem, o que
-//! `timing.rs` usa para alinhar fonemas ↔ palavras.
+//! ela para prosódia/pausas. Quebramos cada palavra em pedaços (texto | pontuação),
+//! fonemizamos os pedaços de texto e recolocamos a pontuação no lugar.
+//!
+//! Alinhamento: `per_word` tem exatamente uma entrada por palavra do texto (fonemas
+//! + pontuação colada), e `phonemes` é `per_word.join(" ")`. É isso que `timing.rs`
+//! usa para saber quais tokens pertencem a qual palavra. Para manter a prosódia,
+//! a 1ª passada fonemiza por cláusula (pedaços entre pontuações, com contexto);
+//! quando o espeak devolve outro número de palavras que a cláusula tinha (ele
+//! funde "there were" → "ðɛɹwˌɜː", lê "2024" em três palavras), só essa cláusula
+//! é refeita um pedaço por linha (o espeak não funde palavras entre linhas).
 
 use anyhow::{bail, Context, Result};
 use std::io::Write;
@@ -58,19 +63,24 @@ impl Lang {
     }
 }
 
-/// Resultado por segmento: a pontuação que veio depois, e os fonemas do segmento.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Phonemized {
     /// String final para tokenizar (fonemas + pontuação + espaços).
     pub phonemes: String,
-    /// Fonemas por palavra, na ordem das palavras do texto de entrada, quando
-    /// o espeak devolveu o mesmo número de "palavras" que a entrada tinha.
-    /// `None` quando não deu para alinhar (timing.rs cai para proporção por chars).
+    /// Uma entrada por palavra do texto (fonemas + pontuação colada; pode ter
+    /// espaços, ex. "2024" → "tˈuː θˈaʊzənd twˈɛnti fˈɔːɹ"). `None` quando o
+    /// espeak devolveu um nº de linhas diferente do pedido (timing.rs cai para
+    /// proporção por chars).
     pub per_word: Option<Vec<String>>,
 }
 
 pub trait Phonemizer: Send {
-    fn phonemize(&mut self, text: &str, lang: Lang) -> Result<Phonemized>;
+    /// Uma saída por entrada, na mesma ordem, sem fundir nem quebrar linhas.
+    fn lines(&mut self, inputs: &[String], lang: Lang) -> Result<Vec<String>>;
+
+    fn phonemize(&mut self, text: &str, lang: Lang) -> Result<Phonemized> {
+        phonemize_words(self, text, lang)
+    }
 }
 
 // -------------------------------------------------------------------- comum
@@ -95,31 +105,106 @@ pub fn normalize(text: &str) -> String {
         .join(" ")
 }
 
-/// Quebra em (segmento_de_texto, pontuação_que_segue). Segmentos vazios são
-/// descartados mas a pontuação deles é anexada ao anterior.
-fn split_punct(text: &str) -> Vec<(String, String)> {
-    let mut out: Vec<(String, String)> = Vec::new();
-    let mut seg = String::new();
-    for c in text.chars() {
-        if PUNCT.contains(&c) {
-            let s = seg.trim().to_string();
-            seg.clear();
-            if s.is_empty() {
-                if let Some(last) = out.last_mut() {
-                    last.1.push(c);
-                }
-            } else {
-                out.push((s, c.to_string()));
-            }
-        } else {
-            seg.push(c);
+/// Uma palavra → pedaços (texto, é_pontuação), na ordem. "concerns—something"
+/// vira [("concerns",f), ("—",t), ("something",f)].
+fn word_pieces(word: &str) -> Vec<(String, bool)> {
+    let mut out: Vec<(String, bool)> = Vec::new();
+    for c in word.chars() {
+        let p = PUNCT.contains(&c);
+        match out.last_mut() {
+            Some((s, was)) if *was == p => s.push(c),
+            _ => out.push((c.to_string(), p)),
         }
     }
-    let s = seg.trim().to_string();
-    if !s.is_empty() {
-        out.push((s, String::new()));
-    }
     out
+}
+
+fn phonemize_words<P: Phonemizer + ?Sized>(be: &mut P, text: &str, lang: Lang) -> Result<Phonemized> {
+    let text = normalize(text);
+    let words: Vec<Vec<(String, bool)>> = text.split_whitespace().map(word_pieces).collect();
+    // pedaços de texto em ordem, com (palavra, índice do pedaço)
+    let mut flat: Vec<(usize, usize)> = Vec::new();
+    // cláusulas = runs de pedaços de texto entre pontuações (atravessam palavras)
+    let mut clauses: Vec<Vec<usize>> = vec![vec![]];
+    for (wi, w) in words.iter().enumerate() {
+        for (pi, (_, punct)) in w.iter().enumerate() {
+            if *punct {
+                if !clauses.last().unwrap().is_empty() {
+                    clauses.push(vec![]);
+                }
+            } else {
+                clauses.last_mut().unwrap().push(flat.len());
+                flat.push((wi, pi));
+            }
+        }
+    }
+    clauses.retain(|c| !c.is_empty());
+    let piece_text = |f: usize| words[flat[f].0][flat[f].1].0.as_str();
+
+    let mut ph: Vec<Option<String>> = vec![None; flat.len()];
+    if !clauses.is_empty() {
+        // 1ª passada: por cláusula, com contexto
+        let inputs: Vec<String> = clauses
+            .iter()
+            .map(|c| c.iter().map(|&f| piece_text(f)).collect::<Vec<_>>().join(" "))
+            .collect();
+        let out = be.lines(&inputs, lang)?;
+        if out.len() != inputs.len() {
+            return Ok(unaligned(&out, lang, inputs.len(), out.len()));
+        }
+        let mut retry: Vec<usize> = Vec::new();
+        for (c, line) in clauses.iter().zip(&out) {
+            let ws: Vec<&str> = line.split_whitespace().collect();
+            if c.len() == 1 {
+                ph[c[0]] = Some(line.clone());
+            } else if ws.len() == c.len() {
+                for (&f, w) in c.iter().zip(ws) {
+                    ph[f] = Some(w.to_string());
+                }
+            } else {
+                retry.extend_from_slice(c);
+            }
+        }
+        // 2ª passada: só os pedaços das cláusulas que o espeak fundiu/expandiu
+        if !retry.is_empty() {
+            let inputs: Vec<String> = retry.iter().map(|&f| piece_text(f).to_string()).collect();
+            let out = be.lines(&inputs, lang)?;
+            if out.len() != inputs.len() {
+                return Ok(unaligned(&out, lang, inputs.len(), out.len()));
+            }
+            for (&f, line) in retry.iter().zip(out) {
+                ph[f] = Some(line);
+            }
+        }
+    }
+
+    let mut per_word: Vec<String> = Vec::with_capacity(words.len());
+    let mut f = 0usize;
+    for w in &words {
+        let mut s = String::new();
+        for (t, punct) in w {
+            if *punct {
+                s.push_str(t);
+            } else {
+                s.push_str(ph[f].as_deref().unwrap_or(""));
+                f += 1;
+            }
+        }
+        per_word.push(kokoro_fixups(s.trim(), lang));
+    }
+    Ok(Phonemized {
+        phonemes: per_word.join(" "),
+        per_word: Some(per_word),
+    })
+}
+
+/// Espeak devolveu outro nº de linhas: fica com os fonemas, sem alinhamento.
+fn unaligned(lines: &[String], lang: Lang, expected: usize, got: usize) -> Phonemized {
+    tracing::debug!(expected, got, "espeak: linhas divergentes");
+    Phonemized {
+        phonemes: kokoro_fixups(&lines.join(" "), lang),
+        per_word: None,
+    }
 }
 
 /// Pós-processamento que o Kokoro aplica em cima da saída do espeak
@@ -161,42 +246,6 @@ pub fn kokoro_fixups(ps: &str, lang: Lang) -> String {
     fixed
 }
 
-/// Junta segmentos fonemizados em uma string final e, se possível, em fonemas por palavra.
-fn assemble(
-    segments: &[(String, String)],
-    phon_lines: &[String],
-    lang: Lang,
-    input_words: usize,
-) -> Phonemized {
-    let mut phonemes = String::new();
-    let mut per_word: Vec<String> = Vec::new();
-    for ((_, punct), line) in segments.iter().zip(phon_lines) {
-        let line = kokoro_fixups(line.trim(), lang);
-        if !phonemes.is_empty() && !phonemes.ends_with(' ') {
-            phonemes.push(' ');
-        }
-        phonemes.push_str(&line);
-        phonemes.push_str(punct);
-        per_word.extend(line.split_whitespace().map(|w| w.to_string()));
-    }
-    let per_word = if per_word.len() == input_words {
-        Some(per_word)
-    } else {
-        None
-    };
-    Phonemized {
-        phonemes: phonemes.trim().to_string(),
-        per_word,
-    }
-}
-
-fn count_words(segments: &[(String, String)]) -> usize {
-    segments
-        .iter()
-        .map(|(s, _)| s.split_whitespace().count())
-        .sum()
-}
-
 // --------------------------------------------------------------------- CLI
 
 pub struct Cli {
@@ -235,6 +284,9 @@ impl Cli {
             .with_context(|| format!("executando {}", self.bin))?;
         {
             let mut stdin = child.stdin.take().context("stdin do espeak")?;
+            // Sem `--stdin` o espeak processa linha a linha: uma saída por
+            // entrada, sem fundir palavras entre linhas (com `--stdin` ele
+            // juntaria tudo numa cláusula e "there were" viraria "ðɛɹwˌɜː").
             for l in lines {
                 stdin.write_all(l.as_bytes())?;
                 stdin.write_all(b"\n")?;
@@ -245,41 +297,15 @@ impl Cli {
             bail!("espeak-ng saiu com {}", out.status);
         }
         let text = String::from_utf8_lossy(&out.stdout);
-        Ok(text
-            .lines()
-            .map(|l| l.trim().to_string())
-            .filter(|l| !l.is_empty())
-            .collect())
+        // Não filtrar linhas vazias: "(" sozinho vira linha vazia e a contagem
+        // de saídas tem que bater com a de entradas.
+        Ok(text.lines().map(|l| l.trim().to_string()).collect())
     }
 }
 
 impl Phonemizer for Cli {
-    fn phonemize(&mut self, text: &str, lang: Lang) -> Result<Phonemized> {
-        let text = normalize(text);
-        let segments = split_punct(&text);
-        if segments.is_empty() {
-            return Ok(Phonemized {
-                phonemes: String::new(),
-                per_word: Some(vec![]),
-            });
-        }
-        let lines: Vec<String> = segments.iter().map(|(s, _)| s.clone()).collect();
-        let phon = self.run(&lines, lang)?;
-        if phon.len() == segments.len() {
-            return Ok(assemble(&segments, &phon, lang, count_words(&segments)));
-        }
-        // O espeak quebrou uma linha em duas (acontece com abreviações tipo "Dr").
-        // Fonemiza tudo de uma vez e desiste do alinhamento por palavra.
-        tracing::debug!(
-            expected = segments.len(),
-            got = phon.len(),
-            "espeak: linhas divergentes"
-        );
-        let joined = self.run(&[text.clone()], lang)?.join(" ");
-        Ok(Phonemized {
-            phonemes: kokoro_fixups(&joined, lang),
-            per_word: None,
-        })
+    fn lines(&mut self, inputs: &[String], lang: Lang) -> Result<Vec<String>> {
+        self.run(inputs, lang)
     }
 }
 
@@ -365,15 +391,9 @@ pub mod ffi {
     }
 
     impl Phonemizer for Ffi {
-        fn phonemize(&mut self, text: &str, lang: Lang) -> Result<Phonemized> {
+        fn lines(&mut self, inputs: &[String], lang: Lang) -> Result<Vec<String>> {
             self.set_lang(lang)?;
-            let text = normalize(text);
-            let segments = split_punct(&text);
-            let mut lines = Vec::with_capacity(segments.len());
-            for (s, _) in &segments {
-                lines.push(self.one_line(s)?);
-            }
-            Ok(assemble(&segments, &lines, lang, count_words(&segments)))
+            inputs.iter().map(|s| self.one_line(s)).collect()
         }
     }
 }
@@ -391,16 +411,57 @@ mod tests {
     }
 
     #[test]
-    fn split_preserva_pontuacao() {
-        let s = split_punct("Olá, mundo. Tudo bem?!");
+    fn pedacos_da_palavra() {
+        let p = |w: &str| word_pieces(w).into_iter().map(|(s, b)| (s, b)).collect::<Vec<_>>();
+        assert_eq!(p("mundo."), vec![("mundo".into(), false), (".".into(), true)]);
         assert_eq!(
-            s,
+            p("“concerns—something”"),
             vec![
-                ("Olá".to_string(), ",".to_string()),
-                ("mundo".to_string(), ".".to_string()),
-                ("Tudo bem".to_string(), "?!".to_string()),
+                ("“".into(), true),
+                ("concerns".into(), false),
+                ("—".into(), true),
+                ("something".into(), false),
+                ("”".into(), true)
             ]
         );
+    }
+
+    /// Backend falso que imita o espeak: fonemas = texto entre colchetes, funde
+    /// "there were" numa palavra só e lê "2024" em três.
+    struct Fake;
+    impl Phonemizer for Fake {
+        fn lines(&mut self, inputs: &[String], _lang: Lang) -> Result<Vec<String>> {
+            Ok(inputs
+                .iter()
+                .map(|l| {
+                    l.replace("there were", "therewere")
+                        .replace("2024", "two twenty four")
+                        .split_whitespace()
+                        .map(|w| format!("[{w}]"))
+                        .collect::<Vec<_>>()
+                        .join(" ")
+                })
+                .collect())
+        }
+    }
+
+    #[test]
+    fn uma_entrada_por_palavra_mesmo_com_fusao_e_numeros() {
+        let ph = Fake.phonemize("Olá, mundo. There were 2024 “risks—and” more?!", Lang::EnUs).unwrap();
+        let pw = ph.per_word.unwrap();
+        assert_eq!(
+            pw,
+            vec![
+                "[Olá],",
+                "[mundo].",
+                "[Theɹe]",
+                "[weɹe]",
+                "[two] [twenty] [fouɹ]",
+                "“[ɹisks]—[and]”",
+                "[moɹe]?!",
+            ]
+        );
+        assert_eq!(ph.phonemes, pw.join(" "));
     }
 
     #[test]
@@ -430,6 +491,10 @@ mod tests {
         assert!(en.phonemes.ends_with('.'));
         assert!(en.phonemes.contains(','));
         assert_eq!(en.per_word.as_ref().map(|w| w.len()), Some(6));
+        // "there were" é o caso que o espeak funde; tem que sair em duas palavras
+        let m = p.phonemize("and there were some (schisms)", Lang::EnUs).unwrap();
+        assert_eq!(m.per_word.as_ref().map(|w| w.len()), Some(5), "{m:?}");
+        assert!(m.per_word.unwrap().iter().all(|w| !w.contains(' ')), "{}", m.phonemes);
         assert!(
             !en.phonemes.contains('r'),
             "r deve virar ɹ: {}",

@@ -1,9 +1,11 @@
 //! Distribuição de tempo por palavra dentro de um chunk.
 //!
 //! Três níveis de qualidade, do melhor para o pior, escolhidos em `word_timings`:
-//!   1. `durations` do modelo "timestamped" (um valor por token, incluindo os pads):
-//!      somamos os frames dos tokens de cada palavra. Alinhamento real.
-//!   2. fonemas por palavra (`per_word` do phonemizer): peso = nº de fonemas.
+//!   1. `durations` do modelo "timestamped" (um valor por token, incluindo os pads)
+//!      + `per_word` do phonemizer (fonemas de cada palavra): os tokens da palavra i
+//!      são os `tokenize(per_word[i])` seguintes, e o espaço depois dela. Somamos os
+//!      frames deles. Alinhamento real.
+//!   2. só `per_word`: peso = nº de fonemas.
 //!   3. só texto: peso = nº de chars da palavra (+1 por pontuação anexada).
 //!
 //! Tudo aqui é função pura sobre slices — fácil de testar e de trocar.
@@ -66,41 +68,43 @@ pub fn words(text: &str) -> Vec<Word<'_>> {
 pub struct Durations<'a> {
     /// Um valor por token do modelo, na mesma ordem dos ids enviados (com os pads).
     pub per_token: &'a [f32],
-    /// Ids enviados ao modelo (com pads), para saber onde caem os espaços.
+    /// Ids enviados ao modelo (com pads), para conferir onde caem os espaços.
     pub token_ids: &'a [i64],
     /// id do token "espaço" no vocab.
     pub space_id: i64,
 }
 
+/// Devolve os timings e se vieram do alinhamento real (nível 1).
 pub fn word_timings(
     text: &str,
     duration_ms: u32,
     per_word_phonemes: Option<&[String]>,
     durations: Option<Durations>,
-) -> Vec<WordTiming> {
+) -> (Vec<WordTiming>, bool) {
     let ws = words(text);
     if ws.is_empty() || duration_ms == 0 {
-        return vec![];
+        return (vec![], false);
     }
+    let per_word = per_word_phonemes.filter(|p| p.len() == ws.len());
 
-    if let Some(d) = durations {
-        if let Some(t) = from_durations(&ws, duration_ms, d) {
-            return t;
+    if let (Some(d), Some(pw)) = (durations, per_word) {
+        if let Some(t) = from_durations(&ws, duration_ms, d, pw) {
+            return (t, true);
         }
     }
 
-    let weights: Vec<f32> = match per_word_phonemes {
-        Some(p) if p.len() == ws.len() => p.iter().map(|ph| phoneme_weight(ph)).collect(),
-        _ => ws.iter().map(|w| char_weight(w.text)).collect(),
+    let weights: Vec<f32> = match per_word {
+        Some(p) => p.iter().map(|ph| phoneme_weight(ph)).collect(),
+        None => ws.iter().map(|w| char_weight(w.text)).collect(),
     };
-    proportional(&ws, duration_ms, &weights)
+    (proportional(&ws, duration_ms, &weights), false)
 }
 
 fn phoneme_weight(ph: &str) -> f32 {
     // marcas de tônica/longa não custam tempo próprio
     let n = ph
         .chars()
-        .filter(|c| !matches!(c, 'ˈ' | 'ˌ' | 'ː' | 'ˑ'))
+        .filter(|c| !matches!(c, 'ˈ' | 'ˌ' | 'ː' | 'ˑ' | ' '))
         .count();
     (n.max(1) as f32) + 0.5 // +0.5: fronteira de palavra tem um custo fixo
 }
@@ -135,55 +139,35 @@ fn proportional(ws: &[Word], duration_ms: u32, weights: &[f32]) -> Vec<WordTimin
     out
 }
 
-/// Soma as durations por "palavra fonêmica" (tokens entre espaços, pulando pads
-/// e pontuação solta). Se a contagem de palavras fonêmicas ≠ palavras do texto,
-/// devolve None e o chamador cai para o proporcional.
-fn from_durations(ws: &[Word], duration_ms: u32, d: Durations) -> Option<Vec<WordTiming>> {
-    if d.per_token.len() != d.token_ids.len() || d.token_ids.len() < 3 {
+/// Soma as durations dos tokens de cada palavra (`tokenize(per_word[i])`) mais o
+/// espaço que a segue (a pausa "pertence" à palavra anterior, visualmente).
+/// Se os ids não casam com o esperado (truncamento em MAX_TOKENS, vocab
+/// diferente), devolve None e o chamador cai para o proporcional.
+fn from_durations(
+    ws: &[Word],
+    duration_ms: u32,
+    d: Durations,
+    per_word: &[String],
+) -> Option<Vec<WordTiming>> {
+    let n = d.token_ids.len();
+    if d.per_token.len() != n || n < 3 {
         return None;
     }
-    let punct_ids: Vec<i64> = {
-        let v = super::vocab::vocab();
-        ";:,.!?¡¿—…\"«»“”"
-            .chars()
-            .filter_map(|c| v.get(&c).copied())
-            .collect()
-    };
-    // agrupa: cada grupo = frames dos tokens de uma palavra + frames da pontuação
-    // e espaço que a seguem (a pausa "pertence" à palavra anterior, visualmente).
-    let mut groups: Vec<f32> = Vec::new();
-    let mut cur = 0f32;
-    let mut in_word = false;
-    let mut leading = 0f32; // pad inicial + silêncio antes da 1ª palavra
-    let n = d.token_ids.len();
-    for i in 0..n {
-        let id = d.token_ids[i];
-        let fr = d.per_token[i];
-        let is_pad = i == 0 || i == n - 1;
-        let is_space = id == d.space_id;
-        let is_punct = punct_ids.contains(&id);
-        if is_pad || is_space || is_punct {
-            if in_word {
-                cur += fr;
-            } else if groups.is_empty() {
-                leading += fr;
-            } else if let Some(last) = groups.last_mut() {
-                *last += fr;
-            }
-            if is_space && in_word {
-                groups.push(cur);
-                cur = 0.0;
-                in_word = false;
-            }
-        } else {
-            cur += fr;
-            in_word = true;
+    let mut groups: Vec<f32> = Vec::with_capacity(ws.len());
+    let mut i = 1usize; // pula o pad inicial
+    let leading = d.per_token[0];
+    for (k, pw) in per_word.iter().enumerate() {
+        let len = super::vocab::tokenize(pw).len();
+        let last = k + 1 == per_word.len();
+        // tokens da palavra + (espaço | pad final)
+        let end = i + len + 1;
+        if end > n || d.token_ids[end - 1] != if last { 0 } else { d.space_id } {
+            return None;
         }
+        groups.push(d.per_token[i..end].iter().sum());
+        i = end;
     }
-    if in_word {
-        groups.push(cur);
-    }
-    if groups.len() != ws.len() {
+    if i != n {
         return None;
     }
     let total_frames: f32 = leading + groups.iter().sum::<f32>();
@@ -225,7 +209,8 @@ mod tests {
 
     #[test]
     fn proporcional_por_chars_cobre_toda_a_duracao() {
-        let t = word_timings("um dois três.", 1000, None, None);
+        let (t, aligned) = word_timings("um dois três.", 1000, None, None);
+        assert!(!aligned);
         assert_eq!(t.len(), 3);
         assert_eq!(t[0].s, 0);
         assert_eq!(t[2].e, 1000);
@@ -239,7 +224,7 @@ mod tests {
     #[test]
     fn proporcional_por_fonemas_quando_alinha() {
         let ph = vec!["ˈa".to_string(), "bbbbbbbb".to_string()];
-        let t = word_timings("a b", 900, Some(&ph), None);
+        let (t, _) = word_timings("a b", 900, Some(&ph), None);
         // pesos 1.5 e 8.5 → 135 ms e 765 ms
         assert_eq!(t[0].e, 135);
         assert_eq!(t[1].s, 135);
@@ -260,8 +245,10 @@ mod tests {
             token_ids: &ids,
             space_id: sp,
         };
-        let t = word_timings("aa a.", 540, None, Some(d));
+        let pw = vec!["aa".to_string(), "a.".to_string()];
+        let (t, aligned) = word_timings("aa a.", 540, Some(&pw), Some(d));
         // total 54 frames → 10 ms/frame; leading 2 → 1ª palavra 20..260 (a,a,space)
+        assert!(aligned);
         assert_eq!(t.len(), 2);
         assert_eq!(t[0].s, 20);
         assert_eq!(t[0].e, 260);
@@ -278,7 +265,9 @@ mod tests {
             token_ids: &ids,
             space_id: 16,
         };
-        let t = word_timings("duas palavras", 100, None, Some(d));
+        let pw = vec!["a".to_string(), "b".to_string()];
+        let (t, aligned) = word_timings("duas palavras", 100, Some(&pw), Some(d));
+        assert!(!aligned);
         assert_eq!(t.len(), 2);
         assert_eq!(t[1].e, 100);
     }

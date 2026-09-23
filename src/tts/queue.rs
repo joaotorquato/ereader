@@ -46,8 +46,9 @@ impl Request {
         h.update([0u8]);
         h.update(format!("{:.2}", self.speed).as_bytes());
         // Bump quando a síntese muda pra clips antigos não serem reaproveitados
-        // (v2: pontuação passou a chegar no modelo — pausas/prosódia diferentes).
-        h.update(b"\0v2");
+        // (v2: pontuação passou a chegar no modelo — pausas/prosódia diferentes;
+        //  v3: fonemização por palavra — timings e prosódia mudaram).
+        h.update(b"\0v3");
         hex::encode(h.finalize())
     }
 }
@@ -274,8 +275,8 @@ fn synthesize(deps: &mut Deps, db: &Db, job: &Job) -> Result<Clip> {
         token_ids: &out.token_ids,
         space_id,
     });
-    let aligned = durations.is_some();
-    let timings = timing::word_timings(&req.text, duration_ms, ph.per_word.as_deref(), durations);
+    let (timings, aligned) =
+        timing::word_timings(&req.text, duration_ms, ph.per_word.as_deref(), durations);
     let timings_json = serde_json::to_string(&timings)?;
 
     db.insert_clip(
