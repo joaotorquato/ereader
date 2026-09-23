@@ -1,4 +1,7 @@
-//! Parágrafo → chunks de ≤ MAX_CHARS, cortando em fim de frase quando possível.
+//! Parágrafo → chunks de ≤ MAX_CHARS, sempre em fim de frase: um parágrafo que
+//! cabe vira um chunk só; senão, o máximo de frases inteiras por chunk. Uma frase
+//! só é cortada no meio (vírgula/espaço) se sozinha já passa de MAX_CHARS — o
+//! Kokoro aceita no máximo 510 tokens de fonema e estouraria.
 //!
 //! Offsets são em unidades UTF-16, não em bytes nem em `char`: é o que o JS usa
 //! em `String.prototype.slice`/`length`, e o front precisa cortar o parágrafo nos
@@ -7,7 +10,9 @@
 
 use serde::Serialize;
 
-pub const MAX_CHARS: usize = 220;
+/// ~400 chars ≈ 400 fonemas+acentos, com folga para o teto de 510 tokens do modelo.
+/// ponytail: teto em chars, não em tokens; medir fonemas se alguma língua estourar.
+pub const MAX_CHARS: usize = 400;
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct Chunk {
@@ -94,7 +99,7 @@ fn sentences(text: &str) -> Vec<String> {
         if matches!(c, '.' | '!' | '?' | '…') {
             // engole pontuação repetida e aspas de fechamento
             while let Some(&n) = chars.peek() {
-                if matches!(n, '.' | '!' | '?' | '…' | '"' | '”' | '»' | ')' | '\'') {
+                if matches!(n, '.' | '!' | '?' | '…' | '"' | '”' | '’' | '»' | ')' | '\'') {
                     cur.push(n);
                     chars.next();
                 } else {
@@ -125,18 +130,22 @@ fn sentences(text: &str) -> Vec<String> {
     out
 }
 
-/// Frase maior que MAX_CHARS: corta em ", ; :" e, se ainda for grande, em espaços.
+/// Frase maior que MAX_CHARS: enche até o limite e corta na última pontuação
+/// fraca (, ; : —) que coube; sem nenhuma (ou cedo demais), no último espaço.
 fn split_long(s: &str) -> Vec<String> {
     let mut pieces: Vec<String> = Vec::new();
     let mut cur = String::new();
     for word in s.split_inclusive(' ') {
         if cur.chars().count() + word.chars().count() > MAX_CHARS && !cur.is_empty() {
-            pieces.push(std::mem::take(&mut cur));
+            let cut = cur
+                .trim_end()
+                .rfind([',', ';', ':', '—', '–'])
+                .map(|i| i + cur[i..].chars().next().unwrap().len_utf8())
+                .filter(|&i| cur[..i].chars().count() > MAX_CHARS / 4);
+            let rest = cut.map(|i| cur.split_off(i)).unwrap_or_default();
+            pieces.push(std::mem::replace(&mut cur, rest));
         }
         cur.push_str(word);
-        if cur.chars().count() > MAX_CHARS / 2 && cur.trim_end().ends_with([',', ';', ':']) {
-            pieces.push(std::mem::take(&mut cur));
-        }
     }
     if !cur.is_empty() {
         pieces.push(cur);
@@ -159,13 +168,13 @@ mod tests {
 
     #[test]
     fn quebra_em_fim_de_frase_e_offsets_fecham() {
-        let a = "a".repeat(150) + ". ";
-        let b = "b".repeat(150) + ".";
+        let a = "a".repeat(250) + ". ";
+        let b = "b".repeat(250) + ".";
         let p = format!("{a}{b}");
         let c = split(&p);
         assert_eq!(c.len(), 2);
         assert_eq!(c[0].offset, 0);
-        assert_eq!(c[1].offset, 152);
+        assert_eq!(c[1].offset, 252);
         let js_like: Vec<u16> = p.encode_utf16().collect();
         let slice = String::from_utf16(
             &js_like[c[1].offset..c[1].offset + c[1].text.encode_utf16().count()],
@@ -176,7 +185,7 @@ mod tests {
 
     #[test]
     fn offset_em_utf16_com_emoji() {
-        let p = "Olá 😀 mundo. Segunda frase bem longa ".to_string() + &"x".repeat(190) + ".";
+        let p = "Olá 😀 mundo. Segunda frase bem longa ".to_string() + &"x".repeat(370) + ".";
         let c = split(&p);
         assert_eq!(c.len(), 2, "{c:?}");
         // "Olá 😀 mundo. " tem 13 chars mas 14 unidades UTF-16
@@ -187,8 +196,43 @@ mod tests {
     fn frase_gigante_e_cortada() {
         let p = "palavra ".repeat(80); // 640 chars sem pontuação
         let c = split(&p);
-        assert!(c.len() >= 3);
+        assert!(c.len() >= 2);
         assert!(c.iter().all(|c| c.text.chars().count() <= MAX_CHARS));
+    }
+
+    #[test]
+    fn frase_gigante_corta_na_ultima_virgula_que_coube() {
+        // vírgulas em ~150 e ~350; o corte deve ser na de ~350, não na primeira
+        let p = format!(
+            "{}, {}, {}.",
+            "aa ".repeat(50).trim_end(),
+            "bb ".repeat(66).trim_end(),
+            "cc ".repeat(100).trim_end()
+        );
+        let c = split(&p);
+        assert!(c[0].text.ends_with("bb,"), "{:?}", c[0].text);
+        assert!(c[0].text.chars().count() > 300);
+        assert_eq!(c[1].offset, c[0].text.encode_utf16().count() + 1);
+        let all: String = c.iter().map(|c| c.text.as_str()).collect::<Vec<_>>().join(" ");
+        assert_eq!(all, p);
+    }
+
+    #[test]
+    fn nunca_corta_frase_que_cabe() {
+        // frase longa sem pontuação interna: antes viraria 2 chunks; agora fica inteira
+        let s = "palavra ".repeat(40).trim_end().to_string() + "."; // ~320 chars
+        let p = format!("Curta. {s} Outra curta.");
+        let c = split(&p);
+        assert!(c.iter().any(|c| c.text.contains(&s)), "{c:?}");
+        assert!(c.iter().all(|c| c.text.ends_with('.')), "{c:?}");
+    }
+
+    #[test]
+    fn paragrafo_que_cabe_vira_um_chunk() {
+        let p = "Frase um. Frase dois, com vírgula! Frase três? ".repeat(6);
+        let c = split(&p);
+        assert_eq!(c.len(), 1, "{c:?}");
+        assert_eq!(c[0].text, p.trim());
     }
 
     #[test]

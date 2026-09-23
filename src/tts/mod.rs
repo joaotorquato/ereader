@@ -1,6 +1,6 @@
 //! TTS: texto → fonemas (espeak-ng) → tokens → Kokoro (ort) → WAV + timings.
 //!
-//! `chunk`     divide parágrafos em pedaços ≤ 220 chars (com offsets UTF-16)
+//! `chunk`     divide parágrafos em frases inteiras, ≤ 400 chars por chunk (com offsets UTF-16)
 //! `phonemize` espeak-ng (CLI ou FFI) + ajustes que o Kokoro espera
 //! `vocab`     mapa fonema → id
 //! `voices`    style vectors (raw .bin por voz ou NPZ)
